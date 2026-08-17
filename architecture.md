@@ -1,0 +1,832 @@
+# Architecture — Graph-Feature AML Detection
+
+**Project:** Anti-money-laundering transaction monitoring on the IBM AML `HI-Small` dataset
+**Track:** Datathon (time-boxed analysis project, not a product)
+**Status:** Design document. This describes *structure, contracts and data flow only* — it deliberately contains no implementation code, per the working agreement in [project_info.md](project_info.md).
+
+---
+
+## 0. How to read this document
+
+This is the blueprint the build follows. It is organised as:
+
+| Section | What it fixes |
+|---|---|
+| [1](#1-design-thesis) | The one-sentence thesis every component must serve |
+| [2](#2-ground-truth-measured-dataset-facts) | **Measured** dataset facts — several override assumptions in the brief |
+| [3](#3-system-architecture) | Layer diagram and the pipeline DAG |
+| [4](#4-repository-layout) | Files and directories |
+| [5](#5-layer-1--ingest--canonicalisation) – [10](#10-layer-6--presentation) | Per-layer component specs, contracts, artifacts |
+| [11](#11-temporal-integrity-architecture) | The leakage architecture — the methodological differentiator |
+| [12](#12-experiment-matrix) | What we actually run, and what each run proves |
+| [13](#13-configuration--reproducibility) | Seeds, config, determinism |
+| [14](#14-production-architecture-documentation-only) | Systems-thinking section — **not built** |
+| [15](#15-risk-register) – [17](#17-scope-guardrails) | Risks, build order, scope discipline |
+
+Function signatures appear as **contracts** (name, inputs, outputs, invariants). Bodies are written later, one step at a time.
+
+---
+
+## 1. Design thesis
+
+> A single transaction rarely looks illicit. A *subgraph* of transactions often does.
+
+Everything in this architecture exists to test that claim and to make the test **credible**:
+
+1. **Build graph-derived features** that encode fan-out, fan-in, cycles, layering and community structure.
+2. **Compute them causally** so no future information leaks into past feature rows.
+3. **Prove the lift with an ablation** (tabular-only vs. tabular+graph) rather than asserting it.
+4. **Evaluate the way a compliance team would** — alerts/day at fixed recall, per-typology recall — not with accuracy.
+
+Three architectural consequences follow, and they drive every decision below:
+
+- The **feature layer is the product**, not the model layer. Model progression is a controlled comparison, not a search for the best number.
+- The **temporal contract** (§11) is a first-class subsystem, not a `train_test_split` argument.
+- Every artifact is **on disk, versioned by config hash, and reproducible from a seed** — because "we can regenerate this" is what makes the ablation believable.
+
+---
+
+## 2. Ground truth: measured dataset facts
+
+These were measured directly from the files in this repo, not taken from the dataset card. **Four of them change the design** and are marked ⚠️.
+
+| Property | Value |
+|---|---|
+| Transaction rows | **5,078,345** |
+| Illicit rows (`Is Laundering = 1`) | **5,177** — **0.102 %** |
+| Time span | **2022-09-01 00:00 → 2022-09-18 16:18** ⚠️ (18 days, minute resolution) |
+| Distinct `(Bank, Account)` node keys | **515,088** |
+| Distinct `Account` strings alone | **515,080** ⚠️ (8 collisions — account numbers are *not* globally unique) |
+| Banks | 30,528 |
+| Self-loop rows (sender == receiver) | **591,212 — 11.6 %**, of which only 11 illicit ⚠️ |
+| Payment formats | Cheque 1.86 M, Credit Card 1.32 M, ACH 601 K, Cash 491 K, Reinvestment 481 K, Wire 172 K, Bitcoin 146 K |
+| Currencies | 15+ (USD 1.88 M, EUR 1.17 M, CHF, CNY, ILS, INR, GBP, RUB, JPY, BTC, …) |
+| Laundering attempts in `Patterns.txt` | **370 blocks**, covering **3,209 transaction rows** ⚠️ |
+| Typology families | FAN-OUT, FAN-IN, CYCLE, SCATTER-GATHER, GATHER-SCATTER, BIPARTITE, STACK, RANDOM |
+
+### 2.1 What these facts force
+
+**⚠️ The span is 18 days, not months.**
+The brief suggests "daily or weekly" snapshots and a "30-day rolling lookback". Weekly gives 2–3 snapshots — useless. A 30-day lookback exceeds the dataset. Therefore:
+
+- Snapshot granularity is **daily → 18 snapshots**.
+- Lookback is a config knob over `{3d, 7d, ∞ (cumulative)}`. `∞` on an 18-day set is *not* the same thing as "leaky" — it is still strictly causal; it just has no recency decay. We report the knob's effect instead of asserting a number.
+- Walk-forward uses **6 blocks × 3 days**.
+
+**⚠️ Account numbers are not globally unique.**
+The canonical node key is the composite `(Bank, Account)`, interned to a contiguous `int32` node id. Using the bare account string would silently merge 8 distinct accounts and corrupt their degree/centrality. Cheap to get right; embarrassing to get wrong in a graph project.
+
+**⚠️ 11.6 % of rows are self-loops** (mostly `Reinvestment`, an account paying itself).
+Self-loops inflate degree, distort PageRank mass and pollute community detection, and carry essentially no laundering signal (11 of 591,212). They are therefore **excluded from graph edge construction** but **retained as tabular rows** to be scored, with `is_self_loop` as a tabular feature. This split — "the graph view and the scoring view are not the same row set" — is an explicit contract in §5.
+
+**⚠️ Typology coverage is partial: 3,209 annotated of 5,177 illicit rows (62 %).**
+Per-typology recall (§9.3) can only be reported over the annotated subset. The remaining 1,968 illicit rows form an explicit `UNANNOTATED` bucket. Reporting per-typology recall as if it covered all positives would be a quiet error; the coverage rate is stated in the report.
+
+**Extreme imbalance (0.102 %) and positive clustering.**
+5,177 positives are not independent — they cluster inside 370 attempts. Consequences: negative sub-sampling for *training* only (§8.3), and **grouped, temporal** evaluation — never a random split, which would scatter a single laundering ring across train and test.
+
+---
+
+## 3. System architecture
+
+### 3.1 Layer view
+
+```mermaid
+flowchart TB
+    subgraph L1["L1 · Ingest & Canonicalisation"]
+        A1[HI-Small_Trans.csv] --> A3[canonical transactions parquet]
+        A2[HI-Small_Patterns.txt] --> A4[typology map parquet]
+        A5[HI-Small_accounts.csv<br/><i>optional</i>] --> A3
+    end
+
+    subgraph L2["L2 · Graph Construction"]
+        A3 --> B1[node interner<br/>Bank,Account → int32]
+        B1 --> B2[daily snapshot graphs<br/>18 × CSR adjacency]
+    end
+
+    subgraph L3["L3 · Feature Engineering"]
+        A3 --> C1[tabular features<br/><i>row-local</i>]
+        A3 --> C2[streaming features<br/><i>O 1 causal counters</i>]
+        B2 --> C3[structural features<br/><i>PageRank · Louvain · ego</i>]
+        B2 --> C4[motif features<br/><i>bounded cycles · fan patterns</i>]
+        C1 & C2 & C3 & C4 --> C5[feature matrix<br/>+ feature group manifest]
+    end
+
+    subgraph L4["L4 · Modelling"]
+        C5 --> D1[temporal splitter]
+        D1 --> D2[baseline · LogReg / Tree]
+        D1 --> D3[bagging · RandomForest]
+        D1 --> D4[boosting · LightGBM]
+        D2 & D3 & D4 --> D5[stack · LR meta-learner]
+    end
+
+    subgraph L5["L5 · Evaluation"]
+        D2 & D3 & D4 & D5 --> E1[AUPRC · PR curves]
+        A4 --> E2[per-typology recall]
+        D5 --> E2
+        D5 --> E3[alerts/day @ 90% recall]
+        D5 --> E4[SHAP attribution]
+        C5 --> E5[walk-forward harness]
+    end
+
+    subgraph L6["L6 · Presentation"]
+        E1 & E2 & E3 & E4 --> F1[report figures]
+        E4 --> F2[Streamlit results viewer<br/><i>optional, timeboxed</i>]
+        B2 --> F2
+    end
+```
+
+### 3.2 Pipeline DAG
+
+Each stage is an idempotent, cached, CLI-invokable step. Re-running a stage with unchanged config is a no-op (hash hit); changing config upstream invalidates everything downstream.
+
+```
+00_ingest      →  02_features   ─┐
+   │               ↑             ├→ 03_train  →  04_evaluate  →  05_report
+   └→ 01_graph  ───┘             │                    ↑
+                                 └────────────────────┘
+                                        (05_walkforward feeds 04)
+```
+
+| Stage | Reads | Writes | Wall-clock budget |
+|---|---|---|---|
+| `00_ingest` | raw CSV/TXT | `transactions.parquet`, `typology_map.parquet`, `node_index.parquet` | ~3 min |
+| `01_graph` | canonical parquet | `snapshots/day=NN/{csr.npz, meta.json}` | ~10 min |
+| `02_features` | parquet + snapshots | `features.parquet`, `feature_manifest.json` | ~25 min |
+| `03_train` | features | `models/{name}/{model.pkl, oof.parquet}` | ~15 min |
+| `04_evaluate` | models + typology map | `metrics/*.json`, `figures/*.png` | ~5 min |
+| `05_report` | metrics + figures | `report/` assets | manual |
+
+Budgets are targets that keep an end-to-end rebuild inside one hackathon evening. If a stage blows its budget, the escape hatch is `config.sampling.account_fraction` (§13.2), **not** silently weakening the temporal contract.
+
+---
+
+## 4. Repository layout
+
+```
+fraud-detection/
+├── README.md                      # problem, dataset link, CDLA-Sharing-1.0 licence, Kaggle
+│                                  #   download commands, setup, reproduction steps
+├── architecture.md                # this document
+├── requirements.txt
+├── .gitignore                     # excludes data/, artifacts/, venv/
+│
+├── config/
+│   ├── default.yaml               # single source of truth: seeds, paths, windows, model params
+│   └── experiments/
+│       ├── ablation_tabular.yaml  # graph feature groups disabled
+│       ├── ablation_graph.yaml    # all feature groups enabled
+│       └── walkforward.yaml       # 6-block rolling-origin config
+│
+├── data/                          # GITIGNORED — never committed
+│   ├── raw/                       # HI-Small_Trans.csv, HI-Small_Patterns.txt, HI-Small_accounts.csv
+│   └── processed/                 # canonical parquet artifacts
+│
+├── artifacts/                     # GITIGNORED — regenerable outputs
+│   ├── snapshots/                 # daily graph snapshots (CSR + metadata)
+│   ├── features/
+│   ├── models/
+│   └── metrics/
+│
+├── src/aml/
+│   ├── config.py                  # typed config loading, config-hash computation
+│   ├── io.py                      # parquet read/write, artifact cache, hash-keyed paths
+│   │
+│   ├── ingest/
+│   │   ├── transactions.py        # CSV → canonical schema, dtype/enum coercion
+│   │   ├── patterns.py            # Patterns.txt block parser → typology map
+│   │   └── accounts.py            # optional account reference join
+│   │
+│   ├── graph/
+│   │   ├── interner.py            # (Bank, Account) → int32 node id, bidirectional
+│   │   ├── backend.py             # GraphBackend protocol: igraph primary, networkx fallback
+│   │   └── snapshots.py           # daily snapshot builder + lookback windowing
+│   │
+│   ├── features/
+│   │   ├── base.py                # FeatureBlock protocol + registry + manifest emitter
+│   │   ├── tabular.py             # row-local: amount, currency, format, time-of-day
+│   │   ├── streaming.py           # O(1) causal counters: degree, volume, turnover latency
+│   │   ├── structural.py          # PageRank, Louvain, ego-net stats (snapshot-based)
+│   │   ├── motifs.py              # bounded-depth cycle / fan-in / fan-out detection
+│   │   └── assemble.py            # join blocks → feature matrix, enforce causality assertions
+│   │
+│   ├── models/
+│   │   ├── registry.py            # name → (estimator factory, hyperparams, feature groups)
+│   │   ├── splits.py              # temporal split, walk-forward block generator
+│   │   ├── sampling.py            # negative sub-sampling + weight correction
+│   │   └── train.py               # fit / persist / out-of-fold prediction
+│   │
+│   ├── evaluate/
+│   │   ├── metrics.py             # AUPRC, PR curve, recall@k, alerts-per-day
+│   │   ├── typology.py            # per-typology recall breakdown
+│   │   ├── explain.py             # SHAP on the tree ensemble
+│   │   ├── walkforward.py         # rolling-origin harness + no-retrain control
+│   │   └── figures.py             # all report plots, one function per exhibit
+│   │
+│   └── viz/
+│       └── subgraph.py            # ego-subgraph extraction + layout for the demo
+│
+├── scripts/                       # thin CLI wrappers, one per DAG stage
+│   ├── 00_ingest.py   01_graph.py   02_features.py
+│   ├── 03_train.py    04_evaluate.py   05_walkforward.py
+│
+├── notebooks/
+│   ├── 01_eda.ipynb               # schema verification, imbalance, typology coverage
+│   ├── 02_graph_exploration.ipynb # degree distributions, sanity checks on snapshots
+│   └── 03_results_narrative.ipynb # the walkthrough used for the demo video
+│
+├── app/
+│   └── streamlit_app.py           # OPTIONAL results viewer over saved predictions
+│
+└── report/
+    └── report.md                  # Problem → Data → Methodology → Results → Limitations
+```
+
+**Design rule:** `src/aml/` holds all logic; `scripts/` and `notebooks/` only orchestrate and narrate. Nothing important is defined in a notebook — notebooks are for the story, modules are for the truth. This is what makes "reproduce our results" a real claim.
+
+---
+
+## 5. Layer 1 — Ingest & canonicalisation
+
+### 5.1 Canonical transaction schema
+
+The raw CSV has two columns literally named `Account` (sender and receiver). Canonicalisation resolves that and fixes dtypes once, so no downstream module ever parses a string.
+
+| Column | Type | Notes |
+|---|---|---|
+| `tx_id` | `int64` | Row ordinal in the **timestamp-sorted** file. Stable primary key. |
+| `timestamp` | `datetime64[s]` | Parsed from `YYYY/MM/DD HH:MM` |
+| `day_idx` | `int16` | 0–17, days since 2022-09-01. The snapshot join key. |
+| `src_bank` / `dst_bank` | `category` | |
+| `src_acct` / `dst_acct` | `string` | |
+| `src_node` / `dst_node` | `int32` | Interned `(bank, acct)` node id |
+| `amount_paid` / `amount_received` | `float64` | |
+| `currency_paid` / `currency_received` | `category` | |
+| `payment_format` | `category` | 7 levels |
+| `is_self_loop` | `bool` | `src_node == dst_node` |
+| `is_cross_currency` | `bool` | `currency_paid != currency_received` |
+| `is_cross_bank` | `bool` | `src_bank != dst_bank` |
+| `label` | `int8` | `Is Laundering` |
+
+**Contracts**
+
+```
+load_transactions(path, cfg) -> DataFrame
+    Post: sorted by (timestamp, tx_id); tx_id is 0..n-1 contiguous;
+          no nulls in [timestamp, src_node, dst_node, amount_paid, label].
+    Invariant: row count == 5_078_345 (asserted; a mismatch means wrong dataset variant).
+
+build_node_index(df) -> NodeIndex
+    Interns (bank, acct) -> int32 in first-appearance order.
+    Post: bijective; persisted so node ids are stable across runs.
+```
+
+> **Why intern rather than use the account string?** Two reasons: the 8 measured cross-bank collisions (§2.1), and because a contiguous `int32` id is what lets the graph layer use CSR sparse matrices instead of Python dict-of-dicts — a ~20× memory difference at 5 M edges.
+
+### 5.2 Typology map
+
+`Patterns.txt` is a block format:
+
+```
+BEGIN LAUNDERING ATTEMPT - FAN-OUT:  Max 16-degree Fan-Out
+<transaction rows, same column order as Trans.csv, no header>
+END LAUNDERING ATTEMPT - FAN-OUT
+```
+
+Parser output — one row per annotated transaction:
+
+| Column | Notes |
+|---|---|
+| `attempt_id` | Block ordinal, 0–369. **The grouping key** that prevents ring-splitting across folds. |
+| `typology` | Normalised family: one of the 8 |
+| `typology_param` | e.g. `16` from "Max 16-degree", `10` from "Max 10 hops" |
+| `tx_id` | Joined back to the canonical table |
+
+**Join strategy.** `Patterns.txt` carries no id, so rows are matched on the full natural key `(timestamp, src_bank, src_acct, dst_bank, dst_acct, amount_paid, currency_paid, payment_format)`. This key is not guaranteed unique, so the parser is required to report and resolve collisions rather than silently `merge`:
+
+```
+parse_patterns(path) -> DataFrame
+link_patterns_to_transactions(patterns, transactions) -> DataFrame
+    Emits a coverage report: matched / unmatched / ambiguous.
+    Assert: matched rows all have label == 1.
+    Expect: ~3_209 matched, ~1_968 illicit rows left as typology = 'UNANNOTATED'.
+```
+
+Any drop in that coverage number is a parser bug, and the assertion is what tells us. The number goes in the report.
+
+---
+
+## 6. Layer 2 — Graph construction
+
+### 6.1 Backend decision (a documented deviation from the brief)
+
+The brief says "`networkx` is acceptable at HI-Small scale". **At the measured scale it is not, for the expensive features.** 515 K nodes × 4.5 M non-self-loop edges in networkx is roughly 3–5 GB of Python objects, with PageRank taking minutes per snapshot and Louvain considerably worse — × 18 snapshots × 2 ablation arms, that is the whole evening.
+
+**Decision:** a thin `GraphBackend` protocol with two implementations.
+
+| Backend | Used for | Why |
+|---|---|---|
+| **`scipy.sparse` CSR + `python-igraph`** | PageRank, Louvain, degree/strength, ego stats | C-backed; seconds not minutes; CSR is the natural form for repeated snapshot builds |
+| **`networkx`** | demo subgraph extraction and plotting only | ergonomic API, drawing integration, tiny inputs |
+
+```
+class GraphBackend(Protocol):
+    def pagerank(self, damping: float) -> np.ndarray          # len == n_nodes
+    def communities(self, seed: int) -> np.ndarray            # node -> community id
+    def degrees(self) -> tuple[np.ndarray, np.ndarray]        # (in, out)
+    def strengths(self) -> tuple[np.ndarray, np.ndarray]      # volume-weighted
+    def neighbors(self, node: int, direction: str) -> np.ndarray
+```
+
+The protocol keeps the swap honest: features are written against the interface, so "we used igraph for speed" is an implementation note, not a methodological change. If igraph install fails on a teammate's machine, the networkx path still produces identical (slower) numbers on a sampled config — and that equivalence is worth one sanity check in `02_graph_exploration.ipynb`.
+
+**Explicitly not attempted:** exact betweenness centrality (super-quadratic, ruled out by the brief and by arithmetic), and any GNN.
+
+### 6.2 Snapshot builder
+
+```
+build_snapshot(transactions, day_idx, lookback_days, cfg) -> Snapshot
+    Edge set: rows with (day_idx - lookback_days) <= t.day_idx <= day_idx
+              AND NOT is_self_loop
+    Parallel edges collapsed to weighted edges: (count, sum_amount, mean_amount, last_ts)
+    Returns: CSR adjacency + node activity mask + metadata
+    Persisted at artifacts/snapshots/lookback=<L>/day=<NN>/
+```
+
+**The critical rule, enforced in code:**
+
+> A transaction on `day_idx = D` may only read structural features from the snapshot built at `day_idx = D - 1`.
+
+Not `D`. The snapshot for day `D` contains the transaction itself, so using it would let a transaction help compute its own features — the exact leak this project claims to have solved. The join is written as an explicit `day_idx - 1` key with an assertion, never an implicit `merge` on `day_idx`.
+
+**Cold start.** Day 0 has no prior snapshot. Its structural features are null-filled and carry `is_cold_start = True`. Day 0 is excluded from *evaluation* but retained in *training* (nulls are informative to a tree model, and LightGBM handles them natively). This is stated in Limitations rather than hidden.
+
+---
+
+## 7. Layer 3 — Feature engineering
+
+The core contribution. Features are organised into **five blocks**, each independently switchable via config — that switch is what physically implements the ablation, so the ablation is a config diff, not a second codebase.
+
+```
+class FeatureBlock(Protocol):
+    name: str
+    group: Literal["tabular", "streaming", "structural", "motif", "reference"]
+    requires_snapshot: bool
+    def compute(self, ctx: FeatureContext) -> DataFrame   # indexed by tx_id
+    def columns(self) -> list[str]
+```
+
+Every block registers its columns into `feature_manifest.json`, which records for each column: block, group, causality class (`row_local` / `causal_streaming` / `lagged_snapshot`), and null policy. **The manifest is the auditable artifact behind the leakage claim** — the report's "which features could leak" table is generated from it, not written by hand.
+
+### 7.1 Block A — Tabular (baseline arm)
+
+Row-local, no graph. This is the *control* in the headline ablation, so it must be a genuinely fair opponent — a deliberately weak baseline would make the lift meaningless.
+
+- `log_amount_paid`, `log_amount_received`, `amount_mismatch_ratio`
+- `currency_paid`, `currency_received`, `is_cross_currency`
+- `payment_format` (7 levels), `is_self_loop`, `is_cross_bank`
+- `hour_of_day`, `day_of_week`, `is_off_hours`
+- **Round-number heuristics**: `is_round_100`, `is_round_1000`, trailing-zero count
+- **Structuring proxy**: distance to nearest common reporting threshold (10 000 in payment currency)
+
+### 7.2 Block B — Streaming account state (causal by construction)
+
+Single pass in timestamp order maintaining per-account state; each transaction reads state *before* its own update. O(1) per row, zero leakage possible. Emitted for **both** endpoints (`src_*` / `dst_*`):
+
+- `tx_count_in`, `tx_count_out`, `volume_in`, `volume_out`
+- **`inout_volume_ratio`** — the pass-through / layering signature
+- `secs_since_last_in`, `secs_since_last_out`
+- **`turnover_latency`** — seconds between receiving funds and sending them onward. Fast turnover is far more suspicious than money that sits.
+- `distinct_counterparties_in/out` (HyperLogLog or capped exact set)
+- `unique_currencies_seen`, `unique_formats_seen`
+- `mean_amount_in/out`, `amount_zscore_vs_own_history`
+- `account_age_secs` (time since first observed activity)
+
+### 7.3 Block C — Structural (snapshot-based, lagged)
+
+Computed once per daily snapshot on the `D-1` graph, joined to day `D`'s transactions for both endpoints:
+
+- `pagerank` (damping 0.85, weighted by amount) — and `pagerank_rank_pct`
+- `in_degree_centrality`, `out_degree_centrality`
+- `louvain_community_id` → `community_size`, `community_internal_density`, `community_illicit_prior` *(computed from **training-window labels only** — see §11.3)*
+- **Ego-network stats** (1-hop): `ego_mean_degree`, `ego_max_degree`, `ego_volume_std`, `ego_size`
+- `neighbour_pagerank_mean` — high-centrality neighbours matter even when the account itself is quiet
+- `same_community_as_counterparty` (bool) — intra-ring transfers
+
+### 7.4 Block D — Motifs (bounded search)
+
+Direct, targeted encodings of the laundering typologies. This is where the thesis becomes literal — these features are *shaped like the patterns in `Patterns.txt`*.
+
+| Feature | Targets typology | Method |
+|---|---|---|
+| `fanout_burst_k` | FAN-OUT | distinct receivers from `src` within a trailing Δt window |
+| `fanin_burst_k` | FAN-IN | distinct senders into `dst` within trailing Δt |
+| `cycle_2hop`, `cycle_3hop`, `cycle_4hop` | CYCLE | bounded-depth directed path search back to `src` within Δt |
+| `gather_scatter_score` | GATHER-SCATTER | fan-in burst followed by fan-out burst on the same node |
+| `chain_depth_est` | STACK | longest bounded causal chain ending at this edge |
+| `bipartite_score` | BIPARTITE | neighbourhood overlap between `src` and `dst` neighbour sets |
+| `amount_conservation` | all | ratio of value out to value in for `dst` within Δt — laundering preserves value minus a fee |
+
+**Bounded means bounded.** Depth ≤ 4, time window ≤ Δt, per-node neighbour fan-out capped at `cfg.motifs.max_branch`. No general cycle enumeration — that is exponential and explicitly out of scope. If a hub node exceeds the branch cap, its motif features are marked censored via `motif_censored = True` rather than being silently truncated to a wrong value.
+
+### 7.5 Block E — Account reference *(optional, gated)*
+
+From `HI-Small_accounts.csv`: entity type (Corporation / Partnership / Sole Proprietorship), bank country parsed from bank name.
+
+**Gate:** included only if it measurably improves validation AUPRC. If it does not, it is cut and that is recorded — the scope test in §17 applies to features too.
+
+### 7.6 Assembly contract
+
+```
+assemble_features(transactions, snapshots, enabled_groups, cfg)
+    -> (DataFrame indexed by tx_id, FeatureManifest)
+
+    Assertions (fail loudly, never warn):
+      A1. Every 'lagged_snapshot' column joined on day_idx - 1.
+      A2. No column derived from any row with timestamp >= this row's timestamp.
+      A3. Row count preserved exactly; tx_id set unchanged.
+      A4. Null rate per column within the block's declared policy.
+      A5. Manifest lists every emitted column; no unmanaged columns reach the model.
+```
+
+A2 is checked structurally (by construction + block-level unit tests on a small synthetic graph with a known future edge), not by hoping.
+
+---
+
+## 8. Layer 4 — Modelling
+
+### 8.1 Progression
+
+Each rung must be **earned by a measured validation improvement**, not assumed.
+
+| # | Model | Role |
+|---|---|---|
+| 1 | Logistic Regression (+ scaling) & single Decision Tree | Interpretable floor. Establishes that the problem is hard. |
+| 2 | Random Forest / Extra Trees | Variance reduction from bagging |
+| 3 | **LightGBM** | Expected strongest single model on tabular data; native nulls and categoricals; fast enough to iterate |
+| 4 | Stacking: LR + RF + LightGBM → **LogisticRegression meta-learner** | Structural diversity, capped at 3 base models |
+
+Stacking uses `sklearn.ensemble.StackingClassifier` with a **temporal** `cv` splitter so out-of-fold predictions are generated causally. In-sample stacking is a bug, not a shortcut — and the default `StratifiedKFold` would be a *temporal* leak even though it is out-of-fold, so the `cv` argument is passed explicitly.
+
+**Not built:** any GNN. Hand-engineered graph features into gradient boosting gets most of the value at a fraction of the implementation risk. GraphSAGE goes in "future work".
+
+### 8.2 Splitting
+
+```
+temporal_split(df, cfg) -> (train_idx, val_idx, test_idx)
+    Default: train days 0-10 | val days 11-12 | test days 13-17
+    Post: max(train.timestamp) < min(val.timestamp) < min(test.timestamp)   [asserted]
+    Post: no attempt_id spans two splits  [asserted — laundering rings must not straddle]
+```
+
+The second assertion is subtle and matters: a fan-out attempt runs for days (the FAN-OUT block in `Patterns.txt` spans 2022-09-01 → 09-04). A boundary cutting through one attempt puts near-identical rows on both sides. Attempts straddling a boundary are assigned wholly to the **earlier** split.
+
+### 8.3 Sampling under 0.102 % imbalance
+
+- **Training set only:** keep all positives, sub-sample negatives to a target ratio (default 1:50), correct with `scale_pos_weight` / `class_weight` so probabilities remain calibrated.
+- **Validation and test sets are never sub-sampled.** Sub-sampling the test set inflates AUPRC by construction and would silently invalidate the headline number. This is enforced in `sampling.py` by making the function require an explicit `split="train"` argument.
+- Sampling seed comes from the global config seed; the sampled index set is persisted so a run is byte-reproducible.
+
+### 8.4 Threshold policy
+
+Models emit scores, not classes. The operating threshold is chosen **on validation** at the recall target (default 0.90) and then applied unchanged to test. Choosing a threshold on test is a leak, and it is the most common one in hackathon submissions.
+
+---
+
+## 9. Layer 5 — Evaluation
+
+Accuracy is never computed or reported. At 0.102 % prevalence, predicting all-negative scores 99.9 % and is worthless.
+
+### 9.1 Primary metrics
+
+- **AUPRC** (primary) with bootstrap CI over test-set resamples
+- **Precision–Recall curve** — the main figure
+- **Recall @ fixed alert budget** and **Precision @ 90 % recall**
+- ROC-AUC computed but reported only as a footnote, explicitly labelled misleading under this prevalence
+
+### 9.2 Business-framed metric
+
+> **"Alerts generated per day at 90 % recall."**
+
+Derived as `alerts_per_day = (test_rows_flagged / test_days)` at the validation-chosen threshold. This is how a compliance team judges a model, and it converts an abstract lift into a staffing statement — "arm B catches the same fraction of laundering while sending analysts N fewer alerts per day."
+
+### 9.3 Per-typology recall
+
+Recall broken out over the 8 families, plus the `UNANNOTATED` bucket, with the **62 % coverage caveat stated on the figure itself**.
+
+**The expected finding:** graph features help disproportionately on structurally-patterned typologies (CYCLE, FAN-OUT, FAN-IN, SCATTER-GATHER) versus RANDOM. That asymmetry is a genuine, defensible result that *confirms the mechanism* rather than a failure to be smoothed over. If graph features helped uniformly across all typologies including RANDOM, that would be evidence something is leaking — the asymmetry is also a leak check.
+
+Note the small-N problem: some families have few annotated attempts, so per-typology recall carries wide error bars. Report counts alongside rates; do not rank families on a 3-positive difference.
+
+### 9.4 Explainability
+
+SHAP (`TreeExplainer`) on the final LightGBM model:
+
+- Global importance **aggregated by feature group** — the direct answer to "do graph-derived or raw transaction features dominate?"
+- Per-typology mean |SHAP| — do cycle features actually fire on CYCLE attempts? A mechanism check, not decoration.
+- Local waterfall plots for 2–3 representative true positives, used in the demo video and the Streamlit viewer.
+
+### 9.5 Walk-forward harness
+
+Simulating the production loop on static data, without building a live system:
+
+```
+6 sequential blocks × 3 days
+
+Retrained arm:     train B1 → predict B2 → +B2 labels → retrain → predict B3 → ...
+Control arm:       train B1 once → predict B2..B6 with the frozen model
+```
+
+Plot AUPRC per block for both arms. The gap is the exhibit: it quantifies model decay and the value of retraining, and it is an uncommon thing to see in a hackathon submission.
+
+**Honest caveat for the report:** 18 days is short for a decay study, and the control arm's block-1-only training set contains few positives, so per-block AUPRC is noisy. We report the trend with error bars and refuse to over-claim a decay rate from 6 noisy points.
+
+### 9.6 Error analysis
+
+- Score distribution of false negatives — near-miss or nowhere close?
+- Are false negatives concentrated in specific typologies or attempt sizes?
+- What do the top false positives look like — are they structurally laundering-like but legitimate? (High-throughput merchants and FX desks are the expected culprits, and that is a *real* AML problem, not a bug.)
+- Are single-transaction attempts (FAN-OUT with `Max 1-degree`) essentially undetectable by graph features? Very likely yes — say so.
+
+---
+
+## 10. Layer 6 — Presentation
+
+### 10.1 Report figures
+
+Every figure is generated by a named function in `evaluate/figures.py` and written to `artifacts/figures/`. No hand-made charts — a figure that cannot be regenerated cannot be trusted.
+
+| Figure | Purpose |
+|---|---|
+| F1 | **PR curves: tabular-only vs. tabular+graph** — the headline |
+| F2 | AUPRC by model rung (baseline → bagging → boosting → stack) |
+| F3 | Per-typology recall, both ablation arms, with N annotated |
+| F4 | Alerts/day vs. recall trade-off curve |
+| F5 | SHAP importance aggregated by feature group |
+| F6 | Walk-forward AUPRC per block: retrained vs. frozen |
+| F7 | Example subgraphs: a detected cycle and a detected fan-out |
+
+### 10.2 Streamlit results viewer *(optional, hard timebox: a few hours)*
+
+Built **only if** the core analysis is complete and stable. It is explicitly a *results viewer over batch predictions* — it reads a saved predictions parquet. No auth, no database, no live ingestion, no API. It is described that way in the report; it must not imply we built a monitoring system.
+
+```
+app/streamlit_app.py
+  ├── Panel 1: top-N flagged accounts, ranked by risk score
+  ├── Panel 2: click a row → ego-subgraph render (the fan-out / cycle / scatter-gather shape)
+  └── Panel 3: SHAP contribution bars for that prediction
+```
+
+Rationale: the subgraph render is dramatically better demo-video material than scrolling a notebook. **If time is short, cut it entirely** — `03_results_narrative.ipynb` with subgraph plots is a fully respectable demo.
+
+---
+
+## 11. Temporal integrity architecture
+
+The methodological differentiator. Three independent mechanisms, because one is easy to claim and hard to believe.
+
+### 11.1 Causality classes
+
+Every feature column is tagged in the manifest with exactly one class:
+
+| Class | Guarantee | Blocks |
+|---|---|---|
+| `row_local` | Derived only from the row itself | A |
+| `causal_streaming` | Derived from state strictly before this row's timestamp | B |
+| `lagged_snapshot` | Derived from the `D-1` snapshot | C, D |
+
+There is no fourth class. A feature that cannot be assigned one of these three does not ship.
+
+### 11.2 Snapshot lag
+
+Illustrated with the enforced offset:
+
+```mermaid
+sequenceDiagram
+    participant D1 as Day D-1 txns
+    participant S as Snapshot(D-1)
+    participant D2 as Day D txns
+    participant M as Model
+
+    D1->>S: build graph from txns ≤ D-1
+    S->>S: PageRank · Louvain · ego stats
+    S->>D2: join structural features (lag = 1 day)
+    D2->>M: score
+    Note over D2,S: Day D transactions are NOT in Snapshot(D-1).<br/>A transaction can never contribute to its own features.
+```
+
+### 11.3 The community-prior trap
+
+`community_illicit_prior` (fraction of a Louvain community's transactions labelled illicit) is the single most dangerous feature in the design: computed naively it leaks **labels**, which is worse than leaking structure and produces a spectacular, meaningless AUPRC.
+
+Rules:
+1. Computed **only from transactions inside the training time window**.
+2. Applied to val/test rows as a lookup of the training-period value — never recomputed on their own labels.
+3. Smoothed toward the global prior (additive smoothing, `alpha` in config) so tiny communities do not produce 0.0/1.0 spikes.
+4. Ablated separately. If it dominates SHAP, that is treated as a **leak alarm to investigate**, not a win.
+
+If it cannot be made safe under time pressure, it is dropped. A feature we cannot defend to a judge is worth less than the metric it buys.
+
+### 11.4 The declared fallback
+
+If time pressure forces a shortcut, the *only* acceptable one is:
+
+- Cheap features (Blocks A, B) computed causally.
+- Expensive structural features (Block C) computed on the full graph.
+- The report states **exactly which columns** have look-ahead leakage and why — generated from the manifest, column by column.
+
+Precision about the shortcut beats a blanket disclaimer. "Our PageRank column has look-ahead over an 18-day window; all other features are causal" is a credible sentence. "Results may be optimistic" is not.
+
+---
+
+## 12. Experiment matrix
+
+| ID | Feature groups | Models | Split | Answers |
+|---|---|---|---|---|
+| **E1** | A only | all 4 rungs | temporal | Tabular baseline — how far does a conventional model get? |
+| **E2** | A + B + C + D | all 4 rungs | temporal | **Headline: the graph lift.** E2 − E1 is the thesis. |
+| E3 | A + B | LightGBM | temporal | Do cheap causal counters alone explain the lift, or is real graph structure needed? |
+| E4 | A + B + C | LightGBM | temporal | Marginal value of motif features specifically |
+| E5 | A + B + C + D + E | LightGBM | temporal | Is the account reference file worth including at all? |
+| E6 | best arm | LightGBM | **walk-forward × 2 arms** | Decay and the value of retraining |
+| E7 | best arm | LightGBM | temporal, lookback ∈ {3d, 7d, ∞} | Does recency-restricted structure beat cumulative? |
+
+E1 and E2 are the same code path with a different config file. E3 is the honest self-check most submissions skip: it isolates whether the "graph lift" is really coming from graph *structure* or just from per-account aggregates that any tabular model could have had.
+
+---
+
+## 13. Configuration & reproducibility
+
+### 13.1 Single source of truth
+
+```yaml
+seed: 42
+paths: {raw, processed, artifacts}
+time:
+  snapshot_granularity: daily
+  lookback_days: null          # null = cumulative
+  train_days: [0, 10]
+  val_days:   [11, 12]
+  test_days:  [13, 17]
+graph:
+  backend: igraph              # igraph | networkx
+  exclude_self_loops: true
+  pagerank_damping: 0.85
+features:
+  enabled_groups: [tabular, streaming, structural, motif]
+  motifs: {max_depth: 4, window_hours: 72, max_branch: 200}
+  community_prior: {enabled: true, alpha: 10.0}
+sampling:
+  negative_ratio: 50
+  account_fraction: 1.0        # escape hatch, see 13.2
+models:
+  recall_target: 0.90
+  stack_cv: temporal
+```
+
+Every artifact path embeds a hash of the config subset that produced it, so two ablation arms cannot overwrite each other's features and a stale cache cannot silently poison a result.
+
+### 13.2 Determinism
+
+- One `seed` propagated to numpy, sklearn, LightGBM, igraph/Louvain, and the negative sampler.
+- LightGBM pinned to deterministic settings (`deterministic=True`, `force_row_wise=True`) — its default multithreaded histogram build is not bit-reproducible.
+- Louvain is stochastic; the seed is passed and the resulting community assignment is persisted with the snapshot rather than recomputed on demand.
+- `requirements.txt` with pinned versions.
+- Sampled index sets persisted, not regenerated.
+
+**The escape hatch.** If wall-clock becomes the binding constraint, `sampling.account_fraction` takes a seeded random sample of *accounts* (keeping all transactions among them, so subgraph structure survives) — deliberately not a random sample of *transactions*, which would shred the graph and quietly destroy the thing being measured. Any run using this is labelled as such in the report.
+
+### 13.3 Repo hygiene
+
+- `data/`, `artifacts/`, `venv/` gitignored. **No CSVs committed** — the README carries Kaggle API download commands instead.
+- Dataset licence **CDLA-Sharing-1.0** noted in the README.
+- Real commit history showing iteration, not one deadline commit.
+
+---
+
+## 14. Production architecture (documentation only)
+
+**This section is written, not built.** It exists to demonstrate systems thinking and is described in the report as design, never as something we shipped.
+
+```mermaid
+flowchart LR
+    subgraph FAST["Scoring path — fast, continuous"]
+        T[Transaction stream<br/>core banking] --> FP[Feature pipeline<br/>graph snapshot features]
+        FP --> SS[Scoring service<br/>ensemble + SHAP]
+        SS --> AQ[Alert queue<br/>ranked by risk]
+        AQ --> AD[Analyst dashboard<br/>investigate + disposition]
+    end
+
+    subgraph SLOW["Retraining loop — slow, human-gated"]
+        AD --> LD[(Labelled data store)]
+        LD --> TP[Training pipeline<br/>scheduled or drift-triggered]
+        TP --> MR[Model registry<br/>manual approval gate]
+        MR -.human sign-off.-> SS
+    end
+```
+
+The points that matter:
+
+- The model **prioritises human attention; it never makes the final call.** Its output is a ranked queue, not a decision.
+- The two loops run at **completely different speeds**. The model does not learn from its own predictions — it learns from analysts' verdicts *on* those predictions.
+- **Label lag is severe** in AML (weeks to months). A freshly scored transaction has a prediction, not a label. Any monitoring that assumes prompt labels is measuring nothing.
+- Training is automated; **promotion is a human decision** — validation, documented comparison against the incumbent, regulatory sign-off.
+- Models are retrained **from scratch** on accumulated data rather than updated incrementally. When a regulator asks you to explain an eight-month-old decision, auditability beats freshness.
+
+---
+
+## 15. Risk register
+
+| # | Risk | Likelihood | Mitigation |
+|---|---|---|---|
+| R1 | Snapshot feature computation blows the time budget | **High** | igraph backend; `account_fraction` escape hatch; snapshots cached and reused across all arms |
+| R2 | `Patterns.txt` → `Trans.csv` join is ambiguous | Medium | Natural-key join with an explicit collision report; coverage assertion; `UNANNOTATED` bucket |
+| R3 | `community_illicit_prior` leaks labels | Medium | §11.3 rules; separate ablation; SHAP dominance treated as an alarm |
+| R4 | Graph lift turns out small | Medium | **This is still a publishable result.** E3 isolates *why*; per-typology breakdown shows *where* it does help. A well-explained null result beats an unexplained win. |
+| R5 | Stacking adds complexity for negligible gain | **High** | Pre-committed: if lift < 0.005 AUPRC, we say so in Limitations and keep LightGBM as the headline model |
+| R6 | Motif search degenerates on hub nodes | Medium | Hard branch cap + `motif_censored` flag rather than silent truncation |
+| R7 | Streamlit app eats analysis time | Medium | Strictly last; hard timebox; cuttable with zero impact on results |
+| R8 | Test AUPRC unstable — only ~1.5 K positives in the test window | Medium | Bootstrap CIs on every reported metric; never rank models on a difference inside the CI |
+
+R4 deserves emphasis: the project is designed so that "graph features gave a modest lift, concentrated entirely in structurally-patterned typologies" is a *successful* outcome. The architecture measures the thesis; it does not require the thesis to win.
+
+---
+
+## 16. Build order
+
+Each step ends at a reviewable checkpoint. No step starts before the previous one is confirmed.
+
+| Step | Deliverable | Checkpoint |
+|---|---|---|
+| 1 | Repo skeleton, config loader, `.gitignore`, README stub | Structure agreed |
+| 2 | `00_ingest` + EDA notebook | Schema verified, imbalance and typology coverage confirmed against §2 |
+| 3 | Node interner + `01_graph` snapshots | Degree distributions sane; snapshot sizes monotone in day |
+| 4 | Blocks A + B + manifest | Feature matrix builds; causality assertions pass |
+| 5 | Temporal split + LightGBM on A only | **E1 baseline number exists** |
+| 6 | Block C (structural) | E2 partial — first look at the lift |
+| 7 | Block D (motifs) | E2 complete — **headline ablation** |
+| 8 | Model progression + stacking | E1/E2 across all rungs |
+| 9 | Evaluation suite: AUPRC, per-typology, alerts/day, SHAP | Figures F1–F5 |
+| 10 | Walk-forward harness | Figure F6 |
+| 11 | Report draft | Methodology + Limitations written |
+| 12 | *(optional)* Streamlit viewer | Demo material |
+| 13 | Demo video | Submission complete |
+
+Step 5 is the pivotal one: after it, a working end-to-end pipeline exists and everything afterwards is incremental improvement against a real number. Getting there early is worth more than any single feature.
+
+---
+
+## 17. Scope guardrails
+
+Every component in this document passes at least one of:
+
+1. Does it strengthen the **analysis or the narrative**?
+2. Will it be **visible in the report or the demo video**?
+3. Does removing it **break a core result**?
+
+### Explicitly out of scope
+
+- Any live / streaming / real-time inference pipeline
+- Deployed API or hosted service; auth, scaling, monitoring, containerisation
+- Graph neural networks *(future work section only)*
+- Exact betweenness centrality
+- Medium or Large dataset variants
+- More than 3–4 base models in the stack
+- Chasing marginal accuracy at the cost of explainability
+
+### Deviations from the original brief, and why
+
+| Brief said | We do | Why |
+|---|---|---|
+| "networkx is acceptable" | igraph/scipy for heavy compute, networkx for viz | 4.5 M edges × 18 snapshots × 2 arms; measured, not assumed (§6.1) |
+| "daily or weekly" snapshots | daily, fixed | Only 18 days of data — weekly gives 2–3 snapshots |
+| "30-day rolling lookback" | lookback ∈ {3d, 7d, cumulative}, tested | 30 days exceeds the dataset span |
+| Per-typology recall | Same, plus an `UNANNOTATED` bucket | Only 62 % of illicit rows are annotated (3,209 / 5,177) |
+| Graph from all transactions | Self-loops excluded from edges, kept as rows | 11.6 % of rows are self-loops carrying ~zero signal but real distortion |
+
+---
+
+## Appendix A — Artifact contracts
+
+| Artifact | Format | Key | Produced by |
+|---|---|---|---|
+| `transactions.parquet` | parquet, snappy | `tx_id` | `00_ingest` |
+| `node_index.parquet` | parquet | `node_id` ↔ `(bank, acct)` | `00_ingest` |
+| `typology_map.parquet` | parquet | `tx_id` → `(attempt_id, typology)` | `00_ingest` |
+| `snapshots/lookback=<L>/day=<NN>/csr.npz` | scipy CSR | `day_idx` | `01_graph` |
+| `features/<confighash>/features.parquet` | parquet | `tx_id` | `02_features` |
+| `features/<confighash>/feature_manifest.json` | json | column name | `02_features` |
+| `models/<exp>/<model>/model.pkl` | joblib | — | `03_train` |
+| `models/<exp>/<model>/predictions.parquet` | parquet | `tx_id` → `score` | `03_train` |
+| `metrics/<exp>.json` | json | metric name | `04_evaluate` |
+| `figures/F<n>_*.png` | png, 300 dpi | — | `04_evaluate` |
+
+## Appendix B — Dataset
+
+**IBM Transactions for Anti Money Laundering (AML)** — synthetic, generated by IBM Research via a multi-agent virtual-world simulation of banks, individuals and companies.
+
+- Kaggle: <https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml>
+- Variant used: **HI-Small** only (HI = higher illicit ratio)
+- Licence: **CDLA-Sharing-1.0**
+- Files: `HI-Small_Trans.csv`, `HI-Small_Patterns.txt`, `HI-Small_accounts.csv` *(optional, gated)*
+- Synthetic data is a stated limitation: patterns are generator-produced, so measured performance is an upper bound on what the same approach would achieve on real bank data.
