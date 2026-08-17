@@ -1,0 +1,38 @@
+# Pinned for reproducibility -- reproducibility is explicitly judged (architecture.md 13.2).
+# Resolved on Python 3.12.4 / Windows. Install with:
+#   python -m venv venv && venv\Scripts\pip install -r requirements.txt && venv\Scripts\pip install -e .
+
+# --- core data ---
+numpy==2.2.6
+pandas==2.3.3
+pyarrow==25.0.1
+scipy==1.18.0
+
+# --- graph ---
+# python-igraph is the compute backend (C-backed PageRank/Louvain); networkx is used
+# only for demo subgraph extraction and plotting. See architecture.md 6.1.
+python-igraph==1.0.0
+networkx==3.6.1
+
+# --- modelling ---
+scikit-learn==1.9.0
+lightgbm==4.7.0
+shap==0.52.0
+
+# --- figures ---
+matplotlib==3.11.1
+seaborn==0.13.2
+
+# --- tooling ---
+PyYAML==6.0.3
+tqdm==4.70.0
+pytest==9.1.1
+ipykernel==7.3.0
+
+# --- dataset download ---
+kaggle==2.2.4
+
+# --- optional: Phase 7 results viewer (architecture.md 10.2) ---
+# Install only if the Streamlit viewer is built; it is the first component cut
+# under time pressure and nothing else depends on it.
+# streamlit==1.41.0

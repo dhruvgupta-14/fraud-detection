@@ -1,0 +1,10 @@
+# E1 -- the control arm of the headline ablation (architecture.md section 12).
+# Row-local features only: no graph, no account-history counters.
+#
+# This is the "conventional model" opponent. It must be a fair one -- a deliberately
+# weak baseline would make the reported lift meaningless.
+
+features:
+  enabled_groups: [tabular]
+  community_prior:
+    enabled: false

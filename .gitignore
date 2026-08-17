@@ -1,4 +1,32 @@
-/venv
-HI-Small_accounts.csv
-HI-Small_Trans.csv
-HI-Small_Patterns.txt
+# --- Data: never committed. See README for Kaggle download commands. ---
+# Dataset is CDLA-Sharing-1.0 licensed and ~515 MB; it is reproducible from Kaggle.
+data/
+*.csv
+*.parquet
+!config/**/*.csv
+
+# --- Regenerable outputs ---
+artifacts/
+report/figures/
+
+# --- Environments ---
+venv/
+.venv/
+env/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Credentials ---
+kaggle.json
+.env
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

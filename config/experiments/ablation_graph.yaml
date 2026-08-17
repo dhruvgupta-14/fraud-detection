@@ -1,0 +1,8 @@
+# E2 -- the treatment arm of the headline ablation (architecture.md section 12).
+# Tabular + causal account counters + snapshot structure + bounded motifs.
+#
+# E2 minus E1 is the thesis. Stated explicitly here rather than relying on the
+# default so that the two arms are a visible, reviewable config diff.
+
+features:
+  enabled_groups: [tabular, streaming, structural, motif]

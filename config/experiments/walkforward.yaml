@@ -1,0 +1,15 @@
+# E6 -- rolling-origin evaluation plus the no-retraining control (architecture.md 9.5).
+#
+# 6 blocks x 3 days over the 18-day span. The harness overrides the train/val/test
+# windows per block, so the split keys below are only the seed values for block 1.
+
+features:
+  enabled_groups: [tabular, streaming, structural, motif]
+
+evaluate:
+  walkforward_blocks: 6
+
+time:
+  train_days: [0, 2]
+  val_days: [3, 4]
+  test_days: [5, 17]

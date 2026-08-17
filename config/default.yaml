@@ -1,0 +1,73 @@
+# Single source of truth for the whole pipeline. See architecture.md section 13.
+# Every artifact path embeds a hash of the config subset that produced it, so two
+# ablation arms cannot overwrite each other and a stale cache cannot poison a result.
+
+seed: 42
+
+paths:
+  raw: data/raw
+  processed: data/processed
+  artifacts: artifacts
+
+dataset:
+  variant: HI-Small
+  # Asserted at ingest. A mismatch means the wrong dataset variant was downloaded.
+  expected_rows: 5078345
+  expected_illicit: 5177
+  expected_nodes: 515088
+  # Patterns.txt annotates only a subset of illicit rows (architecture.md section 2.1).
+  expected_pattern_rows: 3209
+  expected_attempts: 370
+  origin_date: "2022-09-01"
+
+time:
+  snapshot_granularity: daily
+  # null = cumulative history. Dataset spans only 18 days, so a 30d lookback is
+  # meaningless here; experiment E7 sweeps {3, 7, null}.
+  lookback_days: null
+  train_days: [0, 10]
+  val_days: [11, 12]
+  test_days: [13, 17]
+
+graph:
+  backend: igraph          # igraph | networkx
+  exclude_self_loops: true
+  pagerank_damping: 0.85
+  pagerank_weighted: true
+
+features:
+  enabled_groups: [tabular, streaming, structural, motif]
+  streaming:
+    max_tracked_counterparties: 512   # cap on exact distinct-counterparty sets
+  motifs:
+    max_depth: 4
+    window_hours: 72
+    max_branch: 200
+  community_prior:
+    enabled: true
+    alpha: 10.0            # additive smoothing toward the global prior
+
+sampling:
+  negative_ratio: 50       # train split only; val/test are never sub-sampled
+  account_fraction: 1.0    # wall-clock escape hatch (architecture.md section 13.2)
+
+models:
+  recall_target: 0.90
+  stack_cv: temporal
+  lightgbm:
+    n_estimators: 500
+    learning_rate: 0.05
+    num_leaves: 63
+    min_child_samples: 50
+    deterministic: true
+    force_row_wise: true
+  random_forest:
+    n_estimators: 300
+    min_samples_leaf: 5
+  logistic_regression:
+    C: 1.0
+    max_iter: 1000
+
+evaluate:
+  bootstrap_iterations: 200
+  walkforward_blocks: 6

@@ -168,7 +168,8 @@ fraud-detection/
 ├── README.md                      # problem, dataset link, CDLA-Sharing-1.0 licence, Kaggle
 │                                  #   download commands, setup, reproduction steps
 ├── architecture.md                # this document
-├── requirements.txt
+├── requirements.txt               # pinned direct dependencies
+├── pyproject.toml                 # makes `aml` importable via `pip install -e .`
 ├── .gitignore                     # excludes data/, artifacts/, venv/
 │
 ├── config/
@@ -238,9 +239,17 @@ fraud-detection/
 ├── app/
 │   └── streamlit_app.py           # OPTIONAL results viewer over saved predictions
 │
+├── tests/                         # fast guards on the contracts, not exhaustive coverage
+│   ├── test_config_io.py          # config hashing scope, atomic writes, cache reuse
+│   ├── test_ingest.py             # schema + typology-join coverage assertions
+│   ├── test_causality.py          # synthetic graph with a known future edge → A2 must fail
+│   └── test_splits.py             # no attempt_id straddles a split boundary
+│
 └── report/
     └── report.md                  # Problem → Data → Methodology → Results → Limitations
 ```
+
+**On tests:** this is a datathon, not a product, so coverage is not a goal. Tests exist only where a silent failure would invalidate a *result* — leakage, split boundaries, join coverage, cache staleness. Those four failures all produce a plausible-looking number rather than a crash, which is exactly why they need a guard.
 
 **Design rule:** `src/aml/` holds all logic; `scripts/` and `notebooks/` only orchestrate and narrate. Nothing important is defined in a notebook — notebooks are for the story, modules are for the truth. This is what makes "reproduce our results" a real claim.
 
@@ -754,25 +763,112 @@ R4 deserves emphasis: the project is designed so that "graph features gave a mod
 
 ## 16. Build order
 
-Each step ends at a reviewable checkpoint. No step starts before the previous one is confirmed.
+**31 Python modules — 28 core, 3 optional — in 8 phases**, plus 7 non-code deliverables.
 
-| Step | Deliverable | Checkpoint |
+Each phase ends at a reviewable checkpoint. No phase starts before the previous one is confirmed. `Status` is updated as the build progresses and is the single place to look for "where are we".
+
+### Phase 0 — Foundation · `COMPLETE`
+
+Nothing runs without these three. They are boring and they are load-bearing.
+
+| # | Component | Depends on | Status |
+|---|---|---|---|
+| 1 | `.gitignore`, `requirements.txt`, `data/raw/` relocation | — | ✅ |
+| 2 | `src/aml/config.py` | 1 | ✅ |
+| 3 | `src/aml/io.py` | 2 | ✅ |
+
+**Checkpoint:** repo skeleton agreed; the 510 MB of raw data is ignored and relocated; config loads and hashes; artifact cache round-trips.
+
+### Phase 1 — Data · `NOT STARTED`
+
+| # | Component | Depends on | Note |
+|---|---|---|---|
+| 4 | `src/aml/ingest/transactions.py` | 3 | Raw parse, dtype/enum coercion, derived flags |
+| 5 | `src/aml/graph/interner.py` | 4 | `(bank, acct)` → `int32`. **Coupled with 4** — 4 parses, 5 interns, 4 attaches node ids |
+| 6 | `src/aml/ingest/patterns.py` | 4 | Block parser + natural-key join + coverage report |
+| 7 | `scripts/00_ingest.py` | 4,5,6 | CLI wrapper |
+| 8 | `notebooks/01_eda.ipynb` | 7 | Verifies the §2 measured facts hold |
+
+**Checkpoint:** schema verified; imbalance and the 62 % typology coverage confirmed against §2.
+
+### Phase 2 — Graph · `NOT STARTED`
+
+| # | Component | Depends on |
 |---|---|---|
-| 1 | Repo skeleton, config loader, `.gitignore`, README stub | Structure agreed |
-| 2 | `00_ingest` + EDA notebook | Schema verified, imbalance and typology coverage confirmed against §2 |
-| 3 | Node interner + `01_graph` snapshots | Degree distributions sane; snapshot sizes monotone in day |
-| 4 | Blocks A + B + manifest | Feature matrix builds; causality assertions pass |
-| 5 | Temporal split + LightGBM on A only | **E1 baseline number exists** |
-| 6 | Block C (structural) | E2 partial — first look at the lift |
-| 7 | Block D (motifs) | E2 complete — **headline ablation** |
-| 8 | Model progression + stacking | E1/E2 across all rungs |
-| 9 | Evaluation suite: AUPRC, per-typology, alerts/day, SHAP | Figures F1–F5 |
-| 10 | Walk-forward harness | Figure F6 |
-| 11 | Report draft | Methodology + Limitations written |
-| 12 | *(optional)* Streamlit viewer | Demo material |
-| 13 | Demo video | Submission complete |
+| 9 | `src/aml/graph/backend.py` | 5 |
+| 10 | `src/aml/graph/snapshots.py` | 9 |
+| 11 | `scripts/01_graph.py` | 10 |
+| 12 | `notebooks/02_graph_exploration.ipynb` | 11 |
 
-Step 5 is the pivotal one: after it, a working end-to-end pipeline exists and everything afterwards is incremental improvement against a real number. Getting there early is worth more than any single feature.
+**Checkpoint:** degree distributions sane; snapshot sizes monotone in day; igraph↔networkx equivalence spot-checked on a sampled config.
+
+### Phase 3 — Features, cheap half · `NOT STARTED`
+
+| # | Component | Depends on | Block |
+|---|---|---|---|
+| 13 | `src/aml/features/base.py` | 3 | Protocol + registry + manifest emitter |
+| 14 | `src/aml/features/tabular.py` | 13 | A |
+| 15 | `src/aml/features/streaming.py` | 13 | B |
+| 16 | `src/aml/features/assemble.py` | 13,14,15 | Causality assertions A1–A5 live here |
+| 17 | `scripts/02_features.py` | 16 | |
+
+### Phase 4 — First model · `NOT STARTED`
+
+| # | Component | Depends on |
+|---|---|---|
+| 18 | `src/aml/models/splits.py` | 6 — needs `attempt_id` for the no-straddle assertion |
+| 19 | `src/aml/models/sampling.py` | 18 |
+| 20 | `src/aml/models/registry.py` | 13 |
+| 21 | `src/aml/models/train.py` | 18,19,20 |
+| 22 | `scripts/03_train.py` | 21 |
+| 23 | `src/aml/evaluate/metrics.py` | 22 |
+
+**Checkpoint — the pivotal one.** E1 baseline AUPRC exists and the pipeline runs end to end. Everything after this is incremental improvement measured against a real number. Reaching this phase early is worth more than any single feature.
+
+### Phase 5 — The thesis · `NOT STARTED`
+
+| # | Component | Depends on | Produces |
+|---|---|---|---|
+| 24 | `src/aml/features/structural.py` | 10,13 | Block C — E2 partial, first look at the lift |
+| 25 | `src/aml/features/motifs.py` | 10,13 | Block D — E2 complete, **headline ablation** |
+
+Two modules, and they are the entire contribution. Phases 0–4 exist to make these two measurable.
+
+### Phase 6 — Evaluation depth · `NOT STARTED`
+
+| # | Component | Depends on | Figure |
+|---|---|---|---|
+| 26 | `src/aml/evaluate/typology.py` | 6,23 | F3 |
+| 27 | `src/aml/evaluate/explain.py` | 23 | F5 |
+| 28 | `src/aml/evaluate/figures.py` | 23,26,27 | F1, F2, F4 |
+| 29 | `scripts/04_evaluate.py` | 28 | |
+| 30 | `src/aml/evaluate/walkforward.py` | 21,23 | F6 |
+| 31 | `scripts/05_walkforward.py` | 30 | |
+
+### Phase 7 — Optional / gated · `NOT STARTED`
+
+| # | Component | Gate |
+|---|---|---|
+| 32 | `src/aml/ingest/accounts.py` | Only if E5 shows measurable validation lift (Block E) |
+| 33 | `src/aml/viz/subgraph.py` | Needed for F7 and the demo — build even if 34 is cut |
+| 34 | `app/streamlit_app.py` | Hard timebox; first thing cut under pressure |
+
+### Phase 8 — Deliverables · `NOT STARTED`
+
+| # | Component |
+|---|---|
+| 35 | `config/experiments/*.yaml` (written incrementally from Phase 0) |
+| 36 | `README.md` |
+| 37 | `report/report.md` |
+| 38 | `notebooks/03_results_narrative.ipynb` → demo video |
+
+### Critical path and scheduling
+
+**Critical path to the headline result:** 1 → 2 → 3 → 4/5 → 6 → 7 → 13 → 14 → 15 → 16 → 17 → 18 → 21 → 22 → 23 → 24 → 25. That is **17 of the 31 modules**; the remaining 14 are evaluation depth, optional features and presentation.
+
+**Parallelizable across teammates:** 6 is independent of 9–11; 14 and 15 are independent of each other; 26, 27 and 30 are independent once 23 exists. Phases 0–2 are a strict chain and do not parallelize usefully.
+
+**Cut order under time pressure:** 34 → 32 → 30/31 → 27 → 25. Module 25 (motifs) goes last because it is the sharpest part of the thesis — 24 alone still yields a defensible E2 arm.
 
 ---
 
