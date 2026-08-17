@@ -221,6 +221,19 @@ class ArtifactStore:
     def has_processed(self, name: str) -> bool:
         return self.processed(name).is_file()
 
+    def write_processed_json(self, obj: Any, name: str) -> Path:
+        target = self.processed(name)
+        with _atomic_path(target) as tmp:
+            tmp.write_text(json.dumps(obj, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        LOGGER.info("wrote %s", target.relative_to(self.cfg.root))
+        return target
+
+    def read_processed_json(self, name: str) -> Any:
+        target = self.processed(name)
+        if not target.is_file():
+            raise FileNotFoundError(f"Missing {target}. Run scripts/00_ingest.py first.")
+        return json.loads(target.read_text(encoding="utf-8"))
+
     # ------------------------------------------------------------------ stages
 
     def stage(self, stage: str, sections: Sequence[str]) -> StageStore:
