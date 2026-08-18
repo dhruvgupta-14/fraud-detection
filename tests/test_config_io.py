@@ -22,8 +22,14 @@ def test_default_config_loads():
     assert cfg.seed == 42
     assert cfg.dataset.expected_rows == 5_078_345
     assert cfg.dataset.expected_illicit == 5_177
-    assert cfg.time.train_days == (0, 10)
-    assert cfg.time.n_days == 18
+    # Modelling window is days 0-9; days 10-17 are the generator tail (58% illicit on
+    # 0.02% of rows) and are excluded. See architecture.md 2.1.
+    assert cfg.time.max_day == 9
+    assert cfg.time.train_days == (0, 5)
+    assert cfg.time.val_days == (6, 6)
+    assert cfg.time.test_days == (7, 9)
+    assert cfg.time.purge_straddling_attempts is True
+    assert cfg.time.n_days == 10
     assert cfg.graph.exclude_self_loops is True
 
 
@@ -145,3 +151,20 @@ def test_missing_artifact_error_names_the_producing_stage(tmp_cfg, tmp_path, mon
     store = ArtifactStore(tmp_cfg)
     with pytest.raises(FileNotFoundError, match="00_ingest"):
         store.read_processed("transactions.parquet")
+
+
+def test_test_window_may_not_reach_into_the_generator_tail():
+    """Days beyond max_day have an inverted class balance and must not be scored on."""
+    with pytest.raises(ValueError, match="max_day"):
+        load_config(overrides={"time": {"test_days": [7, 12]}})
+
+
+def test_split_windows_must_stay_ordered_and_disjoint():
+    with pytest.raises(ValueError, match="strictly ordered"):
+        load_config(overrides={"time": {"train_days": [0, 6], "val_days": [6, 6]}})
+
+
+def test_single_day_validation_window_is_allowed():
+    """val_days [6, 6] is one day wide; the ordering check must not reject that."""
+    cfg = load_config(overrides={"time": {"val_days": [6, 6]}})
+    assert cfg.time.val_days == (6, 6)

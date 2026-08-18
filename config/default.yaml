@@ -22,12 +22,28 @@ dataset:
 
 time:
   snapshot_granularity: daily
-  # null = cumulative history. Dataset spans only 18 days, so a 30d lookback is
+  # null = cumulative history. The modelling window is 10 days, so a 30d lookback is
   # meaningless here; experiment E7 sweeps {3, 7, null}.
   lookback_days: null
-  train_days: [0, 10]
-  val_days: [11, 12]
-  test_days: [13, 17]
+
+  # MEASURED AT INGEST, days 10-17 hold 1,108 rows (0.02% of the file) at a 58% illicit
+  # rate, against 0.09% on days 0-9. That is a generator artifact: the simulator flushes
+  # remaining laundering patterns without the background licit traffic. Scoring on it
+  # would produce a meaningless AUPRC, so modelling is truncated here.
+  max_day: 9
+
+  # 3,248,921 / 482,751 / 1,345,565 rows and 2,530 / 497 / 1,495 illicit.
+  train_days: [0, 5]
+  val_days: [6, 6]
+  test_days: [7, 9]
+
+  # 305 of 370 laundering attempts span more than one day, up to 8 days inside a 10-day
+  # window, so essentially every boundary is straddled. Assigning whole attempts to the
+  # earlier split (the original plan) would leave test with 59 annotated rows and destroy
+  # the per-typology exhibit. Instead we purge: the boundary stays on the transaction
+  # timestamp, and train-side rows of any attempt reaching into val/test are dropped.
+  # Costs 535 training positives (79% retained); test keeps 913 annotated rows.
+  purge_straddling_attempts: true
 
 graph:
   backend: igraph          # igraph | networkx
@@ -70,4 +86,7 @@ models:
 
 evaluate:
   bootstrap_iterations: 200
-  walkforward_blocks: 6
+  # 5 blocks x 2 days over the 10-day window: train B1 -> predict B2 -> retrain -> ...
+  # gives 4 evaluation points. The original 6x3d assumed an 18-day span.
+  walkforward_blocks: 5
+  walkforward_block_days: 2

@@ -72,14 +72,16 @@ class DatasetConfig:
 class TimeConfig:
     snapshot_granularity: str
     lookback_days: int | None
+    max_day: int
     train_days: tuple[int, int]
     val_days: tuple[int, int]
     test_days: tuple[int, int]
+    purge_straddling_attempts: bool
 
     def __post_init__(self) -> None:
         # The temporal contract is the project's headline methodological claim, so the
         # split boundaries are validated at load time rather than at fit time.
-        if not (self.train_days[1] < self.val_days[0] < self.val_days[1] < self.test_days[0]):
+        if not (self.train_days[1] < self.val_days[0] <= self.val_days[1] < self.test_days[0]):
             raise ValueError(
                 f"Split windows must be strictly ordered and non-overlapping, got "
                 f"train={self.train_days} val={self.val_days} test={self.test_days}"
@@ -91,12 +93,19 @@ class TimeConfig:
         ):
             if window[0] > window[1]:
                 raise ValueError(f"{name} is inverted: {window}")
+        if self.test_days[1] > self.max_day:
+            raise ValueError(
+                f"test_days {self.test_days} extends past max_day={self.max_day}. Days beyond "
+                f"max_day are the generator tail (see architecture.md 2.1) and are excluded "
+                f"from modelling."
+            )
         if self.lookback_days is not None and self.lookback_days < 1:
             raise ValueError(f"lookback_days must be >= 1 or null, got {self.lookback_days}")
 
     @property
     def n_days(self) -> int:
-        return self.test_days[1] + 1
+        """Number of days in the modelling window, tail excluded."""
+        return self.max_day + 1
 
 
 @dataclass(frozen=True)
@@ -169,6 +178,7 @@ class ModelsConfig:
 class EvaluateConfig:
     bootstrap_iterations: int
     walkforward_blocks: int
+    walkforward_block_days: int
 
 
 @dataclass(frozen=True)

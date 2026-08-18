@@ -54,7 +54,11 @@ These were measured directly from the files in this repo, not taken from the dat
 |---|---|
 | Transaction rows | **5,078,345** |
 | Illicit rows (`Is Laundering = 1`) | **5,177** — **0.102 %** |
-| Time span | **2022-09-01 00:00 → 2022-09-18 16:18** ⚠️ (18 days, minute resolution) |
+| Time span | **2022-09-01 00:00 → 2022-09-18 16:18** (18 calendar days, minute resolution) |
+| **Usable modelling window** | **days 0–9 only** ⚠️ — 5,077,237 rows (99.98 %), 4,522 illicit |
+| **Generator tail** | **days 10–17** ⚠️ — 1,108 rows (0.02 %) at a **59.1 % illicit rate**, 664× the main window |
+| Attempt duration | **305 of 370 attempts span >1 day**, up to **8 days** ⚠️ |
+| Max out-degree / in-degree | **168,672** / 1,084 ⚠️ (single dominant hub) |
 | Distinct `(Bank, Account)` node keys | **515,088** |
 | Distinct `Account` strings alone | **515,080** ⚠️ (8 collisions — account numbers are *not* globally unique) |
 | Banks | 30,528 |
@@ -66,12 +70,25 @@ These were measured directly from the files in this repo, not taken from the dat
 
 ### 2.1 What these facts force
 
-**⚠️ The span is 18 days, not months.**
-The brief suggests "daily or weekly" snapshots and a "30-day rolling lookback". Weekly gives 2–3 snapshots — useless. A 30-day lookback exceeds the dataset. Therefore:
+**⚠️ The span is 18 calendar days but only 10 usable days.** *(measured in Phase 1; this replaced the original plan)*
 
-- Snapshot granularity is **daily → 18 snapshots**.
-- Lookback is a config knob over `{3d, 7d, ∞ (cumulative)}`. `∞` on an 18-day set is *not* the same thing as "leaky" — it is still strictly causal; it just has no recency decay. We report the knob's effect instead of asserting a number.
-- Walk-forward uses **6 blocks × 3 days**.
+Activity is not spread across the 18 days. Days 0–9 carry 99.98 % of the rows; days 10–17 carry 1,108 rows — and run a **59.1 % illicit rate against 0.089 % in the main window**. That is not a trend, it is a generator artifact: the IBM simulator flushes its remaining laundering patterns at the end of the run without the background licit traffic that accompanies them earlier.
+
+The originally configured split (train 0–10, val 11–12, test 13–17) would have put **247 rows in the test set at a 58 % positive rate**. Every headline metric would have been unstable *and* wildly optimistic. Therefore:
+
+- Modelling is truncated at **`max_day = 9`**. Days 10–17 are excluded and disclosed in Limitations, not quietly included.
+- Snapshot granularity is **daily → 10 snapshots**. Weekly would give one.
+- Split is re-cut inside the usable window: **train 0–5 / val 6 / test 7–9** → 3,248,921 / 482,751 / 1,345,565 rows and 2,530 / 497 / 1,495 positives.
+- Lookback is a config knob over `{3d, 7d, ∞ (cumulative)}`. `∞` over 10 days is *not* "leaky" — it is still strictly causal, it just has no recency decay. We report the knob's effect rather than asserting a number.
+- Walk-forward uses **5 blocks × 2 days** (4 evaluation points).
+
+**⚠️ Laundering attempts straddle every boundary.** *(measured in Phase 1)*
+
+305 of 370 attempts span more than one day, the longest running 8 days inside a 10-day window. 96 attempts straddle the train|val boundary and 103 straddle val|test. The original §8.2 rule — assign a straddling attempt wholly to the earlier split — assumed straddling was rare; it would leave the test window with **59 annotated rows across 29 attempts**, destroying the per-typology exhibit (F3).
+
+The design is therefore a **purged temporal split** (§8.2), which keeps 913 annotated test rows across 208 attempts at a cost of 535 training positives.
+
+**⚠️ One node has out-degree 168,672.** Roughly a third of all non-self-loop edges originate at a single account. It will dominate PageRank mass and blow past any motif branch cap, so the cap and the `motif_censored` flag (§7.4) are load-bearing rather than defensive decoration.
 
 **⚠️ Account numbers are not globally unique.**
 The canonical node key is the composite `(Bank, Account)`, interned to a contiguous `int32` node id. Using the bare account string would silently merge 8 distinct accounts and corrupt their degree/centrality. Cheap to get right; embarrassing to get wrong in a graph project.
@@ -481,14 +498,32 @@ Stacking uses `sklearn.ensemble.StackingClassifier` with a **temporal** `cv` spl
 
 ### 8.2 Splitting
 
+A **purged** temporal split. The design changed after Phase 1 measurement; the reasoning is worth stating because it is exactly the kind of decision the report is judged on.
+
 ```
 temporal_split(df, cfg) -> (train_idx, val_idx, test_idx)
-    Default: train days 0-10 | val days 11-12 | test days 13-17
+    Window:  day_idx <= cfg.time.max_day (= 9). Days 10-17 are the generator tail.
+    Default: train days 0-5 | val day 6 | test days 7-9
+    Purge:   drop from TRAIN every row whose attempt_id also appears in val or test.
+
     Post: max(train.timestamp) < min(val.timestamp) < min(test.timestamp)   [asserted]
-    Post: no attempt_id spans two splits  [asserted — laundering rings must not straddle]
+    Post: no attempt_id appears in both train and (val | test)              [asserted]
+    Post: val and test are never purged, sub-sampled or otherwise modified  [asserted]
 ```
 
-The second assertion is subtle and matters: a fan-out attempt runs for days (the FAN-OUT block in `Patterns.txt` spans 2022-09-01 → 09-04). A boundary cutting through one attempt puts near-identical rows on both sides. Attempts straddling a boundary are assigned wholly to the **earlier** split.
+**Why purging rather than whole-attempt assignment.** A laundering ring generates near-identical rows over its lifetime, so a boundary cutting through one attempt puts the same ring on both sides and the model effectively memorises rather than generalises. The original rule — push any straddling attempt wholly into the earlier split — is the intuitive fix, and at Phase 1 it turned out to be unusable here: 305 of 370 attempts span more than one day and 103 straddle the val|test boundary, so the rule would leave test with **59 annotated rows across 29 attempts** and the per-typology exhibit (F3) would collapse.
+
+Purging inverts which side pays. The boundary stays on the transaction timestamp, so val and test keep every row that genuinely falls in their window; what is dropped is the *train-side* remainder of any attempt that reaches forward. The model still never sees part of a ring it will be scored on.
+
+| Policy | Train positives | Test annotated rows | Test attempts |
+|---|---|---|---|
+| No handling (naive) | 2,530 | 913 | 208 |
+| Whole attempt → earlier split | 2,530 | **59** | 29 |
+| **Purged (adopted)** | **1,995** (79 %) | **913** | **208** |
+
+The cost is 535 training positives. That is the right trade: training positives are the more replaceable resource, and an evaluation set that cannot support the headline breakdown is worth less than a slightly smaller training set.
+
+**Residual limitation, stated in the report.** The purge keys on `attempt_id`, which only the 62 %-annotated rows carry. The 1,968 `UNANNOTATED` illicit rows cannot be traced to a ring, so overlap involving them is invisible to the purge. This is a real, bounded leak and it is named in Limitations rather than papered over.
 
 ### 8.3 Sampling under 0.102 % imbalance
 
@@ -540,15 +575,17 @@ SHAP (`TreeExplainer`) on the final LightGBM model:
 Simulating the production loop on static data, without building a live system:
 
 ```
-6 sequential blocks × 3 days
+5 sequential blocks × 2 days, over the 10-day usable window (days 0-9)
 
 Retrained arm:     train B1 → predict B2 → +B2 labels → retrain → predict B3 → ...
-Control arm:       train B1 once → predict B2..B6 with the frozen model
+Control arm:       train B1 once → predict B2..B5 with the frozen model
 ```
+
+Four evaluation points, not the six originally planned: the 18-day span assumed in that plan is really 10 usable days (§2.1). Blocks are purged against each other on the same rule as §8.2.
 
 Plot AUPRC per block for both arms. The gap is the exhibit: it quantifies model decay and the value of retraining, and it is an uncommon thing to see in a hackathon submission.
 
-**Honest caveat for the report:** 18 days is short for a decay study, and the control arm's block-1-only training set contains few positives, so per-block AUPRC is noisy. We report the trend with error bars and refuse to over-claim a decay rate from 6 noisy points.
+**Honest caveat for the report:** ten days is short for a decay study, each block holds roughly 900 positives, and the control arm's block-1-only training set is smaller still. We report the trend with bootstrap error bars and explicitly refuse to quote a decay rate from four noisy points. If the two arms overlap inside their CIs, that is the finding and we say so.
 
 ### 9.6 Error analysis
 
@@ -756,6 +793,8 @@ The points that matter:
 | R6 | Motif search degenerates on hub nodes | Medium | Hard branch cap + `motif_censored` flag rather than silent truncation |
 | R7 | Streamlit app eats analysis time | Medium | Strictly last; hard timebox; cuttable with zero impact on results |
 | R8 | Test AUPRC unstable — only ~1.5 K positives in the test window | Medium | Bootstrap CIs on every reported metric; never rank models on a difference inside the CI |
+| R9 | **Host has 5.8 GB RAM** — the feature matrix (5.08 M × ~80 cols) will not fit in float64 | **High** | Measured in Phase 1, where ingest OOM'd twice. Mitigations: float32 feature dtype, column-wise assembly, `sampling.account_fraction` escape hatch, and training on the sub-sampled negative set rather than the full frame. Revisit before Phase 3. |
+| R10 | One node has out-degree 168,672 and will dominate PageRank | Medium | Report PageRank as a percentile rank as well as a raw value; motif branch cap + `motif_censored` flag prevent it from exploding the motif search |
 
 R4 deserves emphasis: the project is designed so that "graph features gave a modest lift, concentrated entirely in structurally-patterned typologies" is a *successful* outcome. The architecture measures the thesis; it does not require the thesis to win.
 
@@ -779,17 +818,19 @@ Nothing runs without these three. They are boring and they are load-bearing.
 
 **Checkpoint:** repo skeleton agreed; the 510 MB of raw data is ignored and relocated; config loads and hashes; artifact cache round-trips.
 
-### Phase 1 — Data · `NOT STARTED`
+### Phase 1 — Data · `COMPLETE`
 
-| # | Component | Depends on | Note |
-|---|---|---|---|
-| 4 | `src/aml/ingest/transactions.py` | 3 | Raw parse, dtype/enum coercion, derived flags |
-| 5 | `src/aml/graph/interner.py` | 4 | `(bank, acct)` → `int32`. **Coupled with 4** — 4 parses, 5 interns, 4 attaches node ids |
-| 6 | `src/aml/ingest/patterns.py` | 4 | Block parser + natural-key join + coverage report |
-| 7 | `scripts/00_ingest.py` | 4,5,6 | CLI wrapper |
-| 8 | `notebooks/01_eda.ipynb` | 7 | Verifies the §2 measured facts hold |
+| # | Component | Depends on | Note | Status |
+|---|---|---|---|---|
+| 4 | `src/aml/ingest/transactions.py` | 3 | Raw parse, dtype/enum coercion, derived flags | ✅ |
+| 5 | `src/aml/graph/interner.py` | 4 | `(bank, acct)` → `int32`. Built with 4 | ✅ |
+| 6 | `src/aml/ingest/patterns.py` | 4 | Block parser + natural-key join + coverage report | ✅ |
+| 7 | `scripts/00_ingest.py` | 4,5,6 | CLI wrapper | ✅ |
+| 8 | `notebooks/01_eda.ipynb` | 7 | Verifies the §2 measured facts hold | ✅ |
 
-**Checkpoint:** schema verified; imbalance and the 62 % typology coverage confirmed against §2.
+**Checkpoint: passed.** Full ingest runs in 52 s; all §2 facts reproduce exactly; the typology join matches 3,209/3,209 with 0 unmatched and 0 ambiguous keys. 35 tests pass.
+
+Two findings from the EDA changed the architecture before any model was built — the generator tail (§2.1) and attempt straddling (§8.2). Both are recorded above and applied in `config/default.yaml`.
 
 ### Phase 2 — Graph · `NOT STARTED`
 
@@ -899,6 +940,11 @@ Every component in this document passes at least one of:
 | "30-day rolling lookback" | lookback ∈ {3d, 7d, cumulative}, tested | 30 days exceeds the dataset span |
 | Per-typology recall | Same, plus an `UNANNOTATED` bucket | Only 62 % of illicit rows are annotated (3,209 / 5,177) |
 | Graph from all transactions | Self-loops excluded from edges, kept as rows | 11.6 % of rows are self-loops carrying ~zero signal but real distortion |
+| 18 days of data | **10 usable days**, `max_day = 9` | Days 10–17 are 0.02 % of rows at a 59 % illicit rate — a generator artifact (§2.1) |
+| Split 0–10 / 11–12 / 13–17 | **0–5 / 6 / 7–9** | The original test window held 247 rows; the new one holds 1.35 M rows and 1,495 positives |
+| Straddling attempts → earlier split | **Purged temporal split** | 82 % of attempts straddle; the original rule left 59 annotated test rows (§8.2) |
+| Walk-forward 6 × 3 days | **5 × 2 days** | Follows from the 10-day window |
+| Assumed a normal dev machine | **Memory-frugal ingest**, float32 features planned | Built on a 5.8 GB machine; see R9 |
 
 ---
 
