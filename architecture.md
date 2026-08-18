@@ -777,7 +777,7 @@ Precision about the shortcut beats a blanket disclaimer. "Our PageRank column ha
 | ID | Feature groups | Models | Split | Answers |
 |---|---|---|---|---|
 | **E1** | A only | all 4 rungs | temporal | ✅ **run** — tabular baseline. LightGBM 0.0485. |
-| **E2** | A + B + C + D | all 4 rungs | temporal | **Headline: the graph lift.** ~~E2 − E1~~ → **E2 − E3** is the thesis (see below). |
+| **E2** | A + B + C + D | all 4 rungs | temporal | ✅ **run** — LightGBM **0.4821**. **E2 − E3 = +0.1246, CIs disjoint.** The thesis, measured against the honest control. |
 | **E3** | A + B | all 4 rungs | temporal | ✅ **run early** — LightGBM **0.3575**. Cheap counters alone give 7.4×, so E3 is the *real* control. |
 | E4 | A + B + C | LightGBM | temporal | Marginal value of motif features specifically |
 | E5 | A + B + C + D + E | LightGBM | temporal | Is the account reference file worth including at all? |
@@ -827,6 +827,26 @@ models:
 ```
 
 Every artifact path embeds a hash of the config subset that produced it, so two ablation arms cannot overwrite each other's features and a stale cache cannot silently poison a result.
+
+> ⚠️ **The hash keys on config, not on code — and that gap nearly corrupted the headline
+> result in Phase 5.** Registering the `structural` and `motif` blocks changed what
+> `enabled_groups: [tabular, streaming, structural, motif]` *means* without changing a byte
+> of config, so `02_features.py --experiment ablation_graph` reported a cache hit and
+> returned the previous 49-column matrix. Training on it would have produced E2 = E3 and a
+> reported graph lift of exactly zero — a plausible, publishable, completely wrong result.
+>
+> It was caught only because the stage summary prints the block list (`blocks: streaming,
+> tabular` where four were expected). **Two mitigations, both cheap:** the summary prints
+> the blocks and column count on every run, and any run following a code change to the
+> feature layer uses `--force`. This is recorded rather than quietly fixed because "cache
+> staleness produces a plausible number rather than a crash" is exactly the failure class
+> §4 says the tests exist to guard, and here the guard was a human reading a log line.
+>
+> **A second collision, found the same way:** `default.yaml` and `ablation_graph.yaml` have
+> identical `features` sections and therefore hash identically, so the E3 arm had no config
+> of its own and its feature matrix was overwritten by E2. `config/experiments/ablation_streaming.yaml`
+> now pins E3 explicitly. Since E3 is the *control* for the headline comparison, an arm that
+> could not be rebuilt was a real reproducibility hole.
 
 ### 13.2 Determinism
 
@@ -1153,14 +1173,117 @@ training rows (3.25 M → 101,745). That was mandatory on the 5.8 GB host; on 15
 train on everything. Whether the discard costs AUPRC is a one-line config change to test in
 Phase 5, alongside the graph features — flagged here rather than swept now.
 
-### Phase 5 — The thesis · `NOT STARTED`
+### Phase 5 — The thesis · `COMPLETE`
 
-| # | Component | Depends on | Produces |
+| # | Component | Depends on | Produces | Status |
+|---|---|---|---|---|
+| 24 | `src/aml/features/structural.py` | 10,13 | Block C — 22 columns | ✅ |
+| 25 | `src/aml/features/motifs.py` | 10,13 | Block D — 15 columns | ✅ |
+
+Two modules, and they are the entire contribution. Phases 0–4 exist to make these two
+measurable. The E2 matrix is **86 columns** — 17 `row_local`, 32 `causal_streaming`,
+**37 `lagged_snapshot`** — built in 167 s. 150 tests pass.
+
+#### The bounded motif search became sparse linear algebra
+
+§7.4 specifies a bounded-depth directed path search with a per-node branch cap and a
+`motif_censored` flag. **Neither is needed**, because the quantity that search approximates
+has a closed form:
+
+| | |
+|---|---|
+| `diag(A²)` | row-sum of `A ∘ Aᵀ` — 2-step closed walks |
+| `diag(A³)` | row-sum of `A² ∘ Aᵀ` |
+| `diag(A⁴)` | row-sum of `A² ∘ (A²)ᵀ` |
+
+Measured on the day-9 snapshot: `A @ A` is 12.3 M non-zeros in **0.24 s**, and all three
+diagonals take **1.05 s** for all 515,088 nodes simultaneously. A depth-4 DFS from every node
+would have been far slower *and* would have needed the branch cap that makes the hub's answer
+wrong. **Exact beats approximate-and-capped when exact is also faster, and this retires R6** —
+there is no branching left to degenerate.
+
+Honest caveat, stated in the module and the report: these are closed **walks**, not simple
+cycles. At lengths 2 and 3 they coincide (self-loops are excluded from the graph); at length 4
+a walk can retrace a 2-cycle, so `cycle_4hop` over-counts. It remains a monotone signal of
+cyclic entanglement, which is what the feature is for.
+
+Cycles turn out to be **rare**: of 515,088 nodes, 6,680 sit in a 2-cycle, 738 in a 3-cycle and
+6,722 in a 4-cycle. So these columns are zero for ~99 % of rows — which is expected for a
+targeted motif feature and is why the per-typology breakdown (§9.3) matters more than the
+aggregate.
+
+#### Three deliberate omissions
+
+- 🔴 **`community_illicit_prior` is dropped.** §11.3 calls it "the single most dangerous
+  feature in the design" — it leaks *labels*, not just structure — and pre-authorises
+  dropping it: "If it cannot be made safe under time pressure, it is dropped." Making it safe
+  requires the feature layer to know the train window, which it deliberately does not; wiring
+  splits into feature assembly is a real architectural complication for a feature whose own
+  design note says SHAP dominance should be treated as a leak alarm rather than a win. Cut,
+  and the reasoning is the report's, not a footnote.
+- **`chain_depth_est`** (targets STACK) is dropped. Longest-bounded-chain is the one quantity
+  here that does not reduce to sparse algebra. STACK therefore has **no dedicated feature**,
+  and §9.3 must say so rather than let a reader assume even typology coverage.
+- **`ego_volume_std`** is dropped as marginal — `ego_mean_degree`, `ego_max_degree` and
+  `neighbour_pagerank_mean` already carry the neighbourhood signal.
+
+#### Deviation: burst windows are daily, not Δt-hours
+
+§7.4 asks for fan-in/fan-out bursts "within a trailing Δt window" (`window_hours: 72`).
+Snapshots are daily by construction (§2.1), so the natural window is one day, and the burst is
+the difference between two consecutive cumulative snapshots — new distinct counterparties
+gained since yesterday. This needs `D-1` *and* `D-2`, so bursts are null on day 1 as well as
+day 0.
+
+#### The headline result
+
+LightGBM across the three arms, test window days 7–9, prevalence 0.1111 %:
+
+| Arm | Features | test AUPRC | 95 % CI | lift | alerts/day @ 90 % recall | % of traffic |
+|---|---|---|---|---|---|---|
+| **E1** tabular | 17 | 0.0485 | [0.0420, 0.0560] | 44× | 197,667 | 44 % |
+| **E3** + account counters | 49 | 0.3575 | [0.3294, 0.3813] | 322× | 58,267 | 13 % |
+| **E2** + graph structure | 86 | **0.4821** | **[0.4571, 0.5053]** | **434×** | **32,503** | **7.2 %** |
+
+> ✅ **The thesis is supported, measured against the honest control.**
+>
+> **E2 − E3 = +0.1246 AUPRC (+35 % relative), and the intervals do not overlap**
+> ([0.4571, 0.5053] vs [0.3294, 0.3813]). R8 pre-committed to never ranking on a difference
+> inside the CI; this one sits outside it, so the claim is one we are entitled to make.
+>
+> The business statement is stronger than the metric: **58,267 → 32,503 alerts per day at
+> identical 90 % recall, a 44 % reduction.** Across all three arms the analyst burden falls
+> from 44 % of all traffic to 7.2 %.
+
+#### The finding underneath the finding: only boosting could use the graph
+
+| Model | E3 | E2 | |
 |---|---|---|---|
-| 24 | `src/aml/features/structural.py` | 10,13 | Block C — E2 partial, first look at the lift |
-| 25 | `src/aml/features/motifs.py` | 10,13 | Block D — E2 complete, **headline ablation** |
+| Logistic regression | 0.0061 | 0.0160 | ↑ |
+| Decision tree | 0.2324 | 0.2177 | **↓ worse** |
+| Random forest | 0.2226 | 0.2406 | ↑ marginal, CIs overlap |
+| **LightGBM** | 0.3575 | **0.4821** | **↑↑** |
 
-Two modules, and they are the entire contribution. Phases 0–4 exist to make these two measurable.
+The depth-8 tree got *worse* with 37 more columns and random forest barely moved. **The graph
+signal is real but requires a model that can compose many weak, sparse, interacting
+features.** Given that the cycle columns are zero for ~99 % of rows, this is exactly the
+profile only boosting should be able to mine — so it is a genuine finding about *why* rung 3
+is the right rung here, rather than an assertion that boosting is generically best. It also
+means the §8.1 progression earned its place: running all four rungs is what exposed this.
+
+#### Reproducibility, verified rather than assumed
+
+E3 was rebuilt from scratch under its own config (`ablation_streaming.yaml`) after the hash
+collision was fixed, and retrained. Every reported figure reproduced **exactly** — 0.0061,
+0.2324, 0.2226, 0.3575, identical confidence intervals and alerts/day. Feature matrix
+regenerated, model refitted, byte-identical metrics.
+
+#### Dormant nodes are null, not zero
+
+Snapshots span the full 515,088-node space, so an account with no edge in the window would
+otherwise receive a teleport-only PageRank and a degree of 0. `active_mask()` (component 9)
+is used to null those columns instead — declared `null_policy: dormant`. The highest observed
+rate is `src_amount_conservation` at 32.9 %.
 
 ### Phase 6 — Evaluation depth · `NOT STARTED`
 

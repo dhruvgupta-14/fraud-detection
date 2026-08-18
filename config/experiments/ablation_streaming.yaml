@@ -1,0 +1,18 @@
+# E3 -- the REAL control for the headline ablation (architecture.md 12).
+#
+# Tabular + causal account counters, and no graph structure whatsoever.
+#
+# This arm was originally a diagnostic ("do cheap counters explain the lift?"). Phase 4
+# measured it and promoted it: per-account aggregates alone take LightGBM from 0.0485 to
+# 0.3575 AUPRC, so reporting E2 - E1 as "the graph lift" would credit graph structure with
+# an aggregation effect it did not produce.
+#
+# The thesis is therefore measured as E2 - E3, and this file is what makes that comparison
+# reproducible. It exists as its own config -- rather than relying on the default -- because
+# artifacts are keyed by a hash of the config sections, and default.yaml now hashes
+# identically to ablation_graph.yaml.
+
+features:
+  enabled_groups: [tabular, streaming]
+  community_prior:
+    enabled: false

@@ -5,7 +5,7 @@ The registry is populated as a side effect of import, so anything calling
 caller has to think about it.
 """
 
-from aml.features import streaming, tabular  # noqa: F401  (registration side effect)
+from aml.features import motifs, streaming, structural, tabular  # noqa: F401  (registration)
 from aml.features.base import (  # noqa: F401
     Causality,
     FeatureBlock,

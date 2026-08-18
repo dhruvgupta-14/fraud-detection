@@ -61,7 +61,7 @@ pip install -e .
 Verify:
 
 ```bash
-pytest -q                     # expect: 136 passed
+pytest -q                     # expect: 150 passed
 ```
 
 ### 2. Dataset
@@ -114,8 +114,11 @@ python scripts/05_walkforward.py               # rolling-origin decay study
 The headline ablation is two runs of the same code path against different configs:
 
 ```bash
-python scripts/02_features.py --experiment ablation_tabular   # arm A: tabular only
-python scripts/02_features.py --experiment ablation_graph     # arm B: tabular + graph
+# E1 -- tabular only          E3 -- + account counters      E2 -- + graph structure
+for arm in ablation_tabular ablation_streaming ablation_graph; do
+    python scripts/02_features.py --experiment $arm
+    python scripts/03_train.py    --experiment $arm
+done
 ```
 
 All randomness flows from a single `seed` in [config/default.yaml](config/default.yaml).
@@ -149,42 +152,47 @@ separation is what makes "reproduce our results" a real claim rather than a hope
 | 2 — Graph | backend, snapshots, snapshot CLI, exploration | ✅ complete |
 | 3 — Features (cheap) | tabular + streaming blocks, causality assertions | ✅ complete |
 | 4 — First model | purged split, sampling, 4 model rungs, AUPRC | ✅ complete |
-| 5 — The thesis | structural + motif features, headline ablation | ⬜ next |
-| 6–8 | evaluation depth → explainability → report | ⬜ |
+| 5 — The thesis | structural + motif features, headline ablation | ✅ complete |
+| 6 — Evaluation depth | per-typology recall, SHAP, figures, walk-forward | ⬜ next |
+| 7–8 | optional viewer → report + demo | ⬜ |
 
-### Baseline result (E1, tabular features only)
+## Headline result
 
-Test window days 7–9, prevalence 0.1111 %, so a random ranker scores AUPRC = 0.0011.
+LightGBM across three arms. Test window days 7–9, prevalence 0.1111 %, so a random ranker
+scores AUPRC = 0.0011.
 
-| Model | test AUPRC | 95 % CI | lift | alerts/day @ 90 % recall |
-|---|---|---|---|---|
-| Logistic regression | 0.0122 | [0.0114, 0.0132] | 11× | 180,530 |
-| Decision tree | 0.0217 | [0.0197, 0.0243] | 20× | 300,009 |
-| Random forest | 0.0473 | [0.0400, 0.0558] | 43× | 161,485 |
-| LightGBM | 0.0485 | [0.0420, 0.0560] | 44× | 197,667 |
+| Arm | Features | test AUPRC | 95 % CI | lift | alerts/day @ 90 % recall | % of traffic |
+|---|---|---|---|---|---|---|
+| **E1** tabular only | 17 | 0.0485 | [0.0420, 0.0560] | 44× | 197,667 | 44 % |
+| **E3** + account counters | 49 | 0.3575 | [0.3294, 0.3813] | 322× | 58,267 | 13 % |
+| **E2** + graph structure | 86 | **0.4821** | **[0.4571, 0.5053]** | **434×** | **32,503** | **7.2 %** |
 
-Random forest and LightGBM **cannot be separated** — their confidence intervals overlap, and
-we do not rank models on a difference inside the interval. More importantly, the best tabular
-model must flag **44 % of all transactions** to reach 90 % recall. That is the problem the
-graph features exist to solve.
+**The graph lift is E2 − E3 = +0.1246 AUPRC (+35 % relative), with non-overlapping confidence
+intervals.** We deliberately do *not* report E2 − E1 as "the graph lift": Block B is
+per-account running counters with no graph structure in it at all, and it alone accounts for
+most of the gap. Crediting graph features with that aggregation effect would overstate the
+result by roughly 6×. The honest control is E3.
 
-### E3 — adding causal account counters (no graph structure)
+In operational terms — the number a compliance team actually cares about — graph features cut
+the alert queue from **58,267 to 32,503 per day at identical 90 % recall, a 44 % reduction**.
 
-| Model | E1 | E3 | 95 % CI | lift | alerts/day |
-|---|---|---|---|---|---|
-| Logistic regression | 0.0122 | 0.0061 ⬇ | [0.0057, 0.0065] | 5× | 94,041 |
-| Decision tree | 0.0217 | 0.2324 | [0.2072, 0.2509] | 209× | 74,180 |
-| Random forest | 0.0473 | 0.2226 | [0.1999, 0.2427] | 200× | 74,680 |
-| **LightGBM** | 0.0485 | **0.3575** | [0.3294, 0.3813] | **322×** | **58,267** |
+**Caveat stated up front:** this is synthetic data whose laundering patterns were inserted by
+a generator, so measured performance is an upper bound on what the same approach would achieve
+on real bank traffic.
 
-**This reframes the headline result.** Block B is per-account running counters — no graph
-structure at all — and it alone improves LightGBM 7.4×, cutting the alert load from 44 % of
-traffic to 13 %. Reporting "tabular vs tabular+graph" would therefore credit graph structure
-with an aggregation effect it did not produce.
+### Secondary finding: only boosting could use the graph features
 
-So the thesis is measured as **E2 − E3**, not E2 − E1: the structural and motif features of
-Phase 5 have to add something on top of 0.3575. All three arms appear in the report, with
-E1 → E3 labelled *account aggregation* and E3 → E2 labelled *graph structure*.
+| Model | E3 | E2 | |
+|---|---|---|---|
+| Logistic regression | 0.0061 | 0.0160 | ↑ |
+| Decision tree | 0.2324 | 0.2177 | ↓ worse |
+| Random forest | 0.2226 | 0.2406 | ↑ marginal, CIs overlap |
+| **LightGBM** | 0.3575 | **0.4821** | ↑↑ |
+
+The depth-8 tree got *worse* with 37 extra columns and the forest barely moved. The graph
+signal is real but sparse and interaction-heavy — the cycle features are zero for ~99 % of
+rows — so it needs a model that can compose many weak features. Running all four rungs is
+what exposed this.
 
 ## Scope
 

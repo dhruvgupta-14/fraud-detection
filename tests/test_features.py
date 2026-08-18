@@ -46,6 +46,16 @@ def tabular(df: pd.DataFrame) -> pd.DataFrame:
     return TabularBlock().compute(FeatureContext(df, load_config(), n_nodes=3))
 
 
+def snapshotless_cfg():
+    """Config with only the blocks that need no graph.
+
+    The default config enables structural and motif, which require snapshots from stage 01.
+    These tests exercise assembly mechanics, not the graph layer, so they pin the groups
+    rather than building a snapshot fixture that has nothing to do with what they assert.
+    """
+    return load_config(overrides={"features": {"enabled_groups": ["tabular", "streaming"]}})
+
+
 # --------------------------------------------------------------------------------------
 # Block A -- row-local
 # --------------------------------------------------------------------------------------
@@ -147,7 +157,7 @@ def test_a3_row_count_change_is_rejected():
 
 def test_assembly_preserves_keys_and_row_count():
     df = frame_from([100.0, 200.0, 300.0])
-    out, manifest = assemble_features(df, load_config(), n_nodes=3)
+    out, manifest = assemble_features(df, snapshotless_cfg(), n_nodes=3)
     assert len(out) == len(df)
     assert out["tx_id"].tolist() == df["tx_id"].tolist()
     assert all(col in out.columns for col in PASSTHROUGH)
@@ -155,7 +165,7 @@ def test_assembly_preserves_keys_and_row_count():
 
 def test_assembly_emits_exactly_the_manifest_columns():
     df = frame_from([100.0, 200.0])
-    out, manifest = assemble_features(df, load_config(), n_nodes=3)
+    out, manifest = assemble_features(df, snapshotless_cfg(), n_nodes=3)
     declared = {c["column"] for c in manifest["columns"]}
     assert set(out.columns) - set(PASSTHROUGH) == declared
     assert manifest["n_columns"] == len(declared)
@@ -164,7 +174,7 @@ def test_assembly_emits_exactly_the_manifest_columns():
 def test_label_is_passthrough_not_a_feature():
     """The single most costly possible bug: training on the target."""
     df = frame_from([100.0, 200.0])
-    _, manifest = assemble_features(df, load_config(), n_nodes=3)
+    _, manifest = assemble_features(df, snapshotless_cfg(), n_nodes=3)
     assert "label" not in {c["column"] for c in manifest["columns"]}
 
 
