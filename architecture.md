@@ -776,15 +776,24 @@ Precision about the shortcut beats a blanket disclaimer. "Our PageRank column ha
 
 | ID | Feature groups | Models | Split | Answers |
 |---|---|---|---|---|
-| **E1** | A only | all 4 rungs | temporal | Tabular baseline — how far does a conventional model get? |
-| **E2** | A + B + C + D | all 4 rungs | temporal | **Headline: the graph lift.** E2 − E1 is the thesis. |
-| E3 | A + B | LightGBM | temporal | Do cheap causal counters alone explain the lift, or is real graph structure needed? |
+| **E1** | A only | all 4 rungs | temporal | ✅ **run** — tabular baseline. LightGBM 0.0485. |
+| **E2** | A + B + C + D | all 4 rungs | temporal | **Headline: the graph lift.** ~~E2 − E1~~ → **E2 − E3** is the thesis (see below). |
+| **E3** | A + B | all 4 rungs | temporal | ✅ **run early** — LightGBM **0.3575**. Cheap counters alone give 7.4×, so E3 is the *real* control. |
 | E4 | A + B + C | LightGBM | temporal | Marginal value of motif features specifically |
 | E5 | A + B + C + D + E | LightGBM | temporal | Is the account reference file worth including at all? |
 | E6 | best arm | LightGBM | **walk-forward × 2 arms** | Decay and the value of retraining |
 | E7 | best arm | LightGBM | temporal, lookback ∈ {3d, 7d, ∞} | Does recency-restricted structure beat cumulative? |
 
-E1 and E2 are the same code path with a different config file. E3 is the honest self-check most submissions skip: it isolates whether the "graph lift" is really coming from graph *structure* or just from per-account aggregates that any tabular model could have had.
+E1 and E2 are the same code path with a different config file. E3 is the honest self-check
+most submissions skip: it isolates whether the "graph lift" is really coming from graph
+*structure* or just from per-account aggregates that any tabular model could have had.
+
+**Measured at the end of Phase 4, E3 answered that question before E2 existed.** Per-account
+aggregates alone take LightGBM from 0.0485 to 0.3575 — 7.4×. Reporting E2 − E1 as "the graph
+lift" would therefore credit graph structure with an aggregation effect. The headline
+comparison is **E2 − E3**, with E1 → E3 → E2 all shown so the reader sees where the gain
+actually comes from. This is recorded here rather than quietly adjusted later because the
+experiment matrix is what the report's results section is generated from.
 
 ---
 
@@ -1049,18 +1058,100 @@ with no registered block silently contributes nothing. That is exactly how the E
 quietly run as E3 and the headline lift would be reported against the wrong feature set, so
 `assemble.py` warns when a group is enabled but dormant.
 
-### Phase 4 — First model · `NOT STARTED`
+### Phase 4 — First model · `COMPLETE`
 
-| # | Component | Depends on |
-|---|---|---|
-| 18 | `src/aml/models/splits.py` | 6 — needs `attempt_id` for the no-straddle assertion |
-| 19 | `src/aml/models/sampling.py` | 18 |
-| 20 | `src/aml/models/registry.py` | 13 |
-| 21 | `src/aml/models/train.py` | 18,19,20 |
-| 22 | `scripts/03_train.py` | 21 |
-| 23 | `src/aml/evaluate/metrics.py` | 22 |
+| # | Component | Depends on | Status |
+|---|---|---|---|
+| 18 | `src/aml/models/splits.py` | 6 — needs `attempt_id` for the no-straddle assertion | ✅ |
+| 19 | `src/aml/models/sampling.py` | 18 | ✅ |
+| 20 | `src/aml/models/registry.py` | 13 | ✅ |
+| 21 | `src/aml/models/train.py` | 18,19,20 | ✅ |
+| 22 | `scripts/03_train.py` | 21 | ✅ |
+| 23 | `src/aml/evaluate/metrics.py` | 22 | ✅ |
 
-**Checkpoint — the pivotal one.** E1 baseline AUPRC exists and the pipeline runs end to end. Everything after this is incremental improvement measured against a real number. Reaching this phase early is worth more than any single feature.
+**Checkpoint: passed.** The purged split reproduces §8.2 exactly — 1,995 train positives
+(79 % of 2,530), 535 purged, val 497, test 1,495 — which is independent confirmation that
+the Phase 1 measurement and the Phase 4 implementation agree. 136 tests pass. Full arm
+trains in 5.4 min against a 15 min budget.
+
+#### E1 — the tabular baseline (test window, days 7–9)
+
+| Rung | Model | val AUPRC | test AUPRC | 95 % CI | lift over random | alerts/day @ 90 % recall |
+|---|---|---|---|---|---|---|
+| 1 | Logistic regression | 0.0118 | 0.0122 | [0.0114, 0.0132] | 11× | 180,530 |
+| 1 | Decision tree | 0.0167 | 0.0217 | [0.0197, 0.0243] | 20× | 300,009 |
+| 2 | Random forest | 0.0331 | 0.0473 | [0.0400, 0.0558] | 43× | 161,485 |
+| 3 | **LightGBM** | **0.0410** | **0.0485** | [0.0420, 0.0560] | **44×** | 197,667 |
+
+Test prevalence is 0.1111 %, so a random ranker scores AUPRC = 0.0011. The progression is
+the one §8.1 predicts: bagging beats a single tree, boosting edges bagging.
+
+**Two honest readings of this table, and both go in the report.**
+
+1. 🔴 **Random forest and LightGBM cannot be separated.** Their CIs overlap heavily
+   ([0.0400, 0.0558] vs [0.0420, 0.0560]). R8 pre-commits to never ranking models on a
+   difference inside the interval, so the correct statement is "boosting and bagging are
+   indistinguishable on this arm", **not** "LightGBM wins". The pre-commitment is doing its
+   job on the very first result.
+2. 🔴 **The baseline is operationally useless, and that is the finding.** At 90 % recall the
+   best tabular model flags ~197,667 alerts per day against ~448,522 test transactions per
+   day — **44 % of all traffic**. That is not a monitoring system, it is a manual review of
+   the entire book. This is exactly the business framing §9.2 asks for, and it is a far more
+   compelling setup for the graph arm than an AUPRC delta: the question becomes "can graph
+   structure make this staffable?" rather than "can we add 0.01 AUPRC?".
+
+#### E3 — tabular + streaming counters, run early *(and it reframes the whole thesis)*
+
+Running the second arm cost one command, so it was run immediately. It is **experiment E3**
+from §12: tabular plus the causal account counters, no graph structure at all.
+
+| Model | E1 test AUPRC | E3 test AUPRC | E3 95 % CI | lift | alerts/day |
+|---|---|---|---|---|---|
+| Logistic regression | 0.0122 | **0.0061** ⬇ | [0.0057, 0.0065] | 5× | 94,041 |
+| Decision tree | 0.0217 | 0.2324 | [0.2072, 0.2509] | 209× | 74,180 |
+| Random forest | 0.0473 | 0.2226 | [0.1999, 0.2427] | 200× | 74,680 |
+| **LightGBM** | 0.0485 | **0.3575** | [0.3294, 0.3813] | **322×** | **58,267** |
+
+LightGBM improves **7.4×**, and the alert load falls from 44 % of all traffic to 13 %.
+
+> 🔴 **The headline ablation must be re-framed, and this is the most consequential finding
+> of the build so far.**
+>
+> **Block B contains no graph structure.** It is per-account running counters — volume in and
+> out, turnover latency, distinct counterparties — the sort of thing any analyst computes
+> with a `GROUP BY`. On their own they deliver a 7.4× AUPRC gain.
+>
+> The originally planned headline, **E1 vs E2, would therefore materially overstate the
+> graph contribution**: most of that gap is already spent before a single snapshot feature
+> exists. §12 anticipated this precisely — E3 is described there as "the honest self-check
+> most submissions skip" — and the answer arrived early and emphatic.
+>
+> **The thesis is measured by E2 − E3, not E2 − E1.** Phase 5's structural and motif features
+> must add something on top of **0.3575**, not on top of 0.0485. That is a far harder bar,
+> and reporting it as the headline is what separates this from a submission that quietly
+> credits its graph features with an aggregation effect. All three arms go in the report;
+> E1 → E3 is labelled "account aggregation" and E3 → E2 is labelled "graph structure".
+
+**Two secondary findings, both worth a line in the report.**
+
+- **Logistic regression got *worse* with more features** (0.0122 → 0.0061), with a large
+  val/test gap (0.0261 → 0.0061). Median-imputing heavy-tailed, mostly-cold-start counters
+  destroys a linear model. It is retained as the interpretable floor — showing that the
+  problem defeats a linear model is the point of rung 1 — but it is not tuned further.
+- **A depth-8 decision tree matches a 300-tree forest** (CIs overlap). §8.1 predicts bagging
+  should reduce variance visibly; here it does not, which suggests the signal is
+  concentrated in a few strong, shallow splits on the counter features.
+
+**Rung 4 (stacking) is deliberately not built.** It needs a temporal CV splitter wired into
+`StackingClassifier` and refits every base model k times, and R5 already pre-commits to
+dropping it if the lift is under 0.005 AUPRC. LightGBM now leads the next-best model by
+0.125 AUPRC with non-overlapping intervals, so a stack would have to beat a clear winner
+rather than break a tie. Deferred to Phase 6, built only if Phase 5 changes that picture.
+
+**`negative_ratio: 50` is now a speed knob, not a memory necessity.** It discards 96.9 % of
+training rows (3.25 M → 101,745). That was mandatory on the 5.8 GB host; on 15.7 GB we could
+train on everything. Whether the discard costs AUPRC is a one-line config change to test in
+Phase 5, alongside the graph features — flagged here rather than swept now.
 
 ### Phase 5 — The thesis · `NOT STARTED`
 

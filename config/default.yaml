@@ -80,6 +80,12 @@ models:
   random_forest:
     n_estimators: 300
     min_samples_leaf: 5
+  decision_tree:
+    # Depth-capped on purpose: rung 1 is the interpretable floor that establishes the
+    # problem is hard. An unbounded tree would memorise the sampled training set and
+    # report a floor that is not one.
+    max_depth: 8
+    min_samples_leaf: 50
   logistic_regression:
     C: 1.0
     max_iter: 1000

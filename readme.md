@@ -61,7 +61,7 @@ pip install -e .
 Verify:
 
 ```bash
-pytest -q                     # expect: 120 passed
+pytest -q                     # expect: 136 passed
 ```
 
 ### 2. Dataset
@@ -106,7 +106,7 @@ python scripts/00_ingest.py                    # raw -> canonical parquet       
 python scripts/01_graph.py                     # 10 daily snapshot graphs        (~30 s)
 python scripts/01_graph.py --verify-backend    # igraph vs networkx checkpoint
 python scripts/02_features.py                  # feature matrix + manifest    (~90 s)
-python scripts/03_train.py                     # model rungs + OOF predictions
+python scripts/03_train.py                     # 4 model rungs + predictions   (~5 min)
 python scripts/04_evaluate.py                  # metrics + report figures
 python scripts/05_walkforward.py               # rolling-origin decay study
 ```
@@ -148,8 +148,43 @@ separation is what makes "reproduce our results" a real claim rather than a hope
 | 1 — Data | ingest, interner, patterns, EDA | ✅ complete |
 | 2 — Graph | backend, snapshots, snapshot CLI, exploration | ✅ complete |
 | 3 — Features (cheap) | tabular + streaming blocks, causality assertions | ✅ complete |
-| 4 — First model | splits, sampling, training, AUPRC baseline | ⬜ next |
-| 5–8 | structural + motif features → evaluation → report | ⬜ |
+| 4 — First model | purged split, sampling, 4 model rungs, AUPRC | ✅ complete |
+| 5 — The thesis | structural + motif features, headline ablation | ⬜ next |
+| 6–8 | evaluation depth → explainability → report | ⬜ |
+
+### Baseline result (E1, tabular features only)
+
+Test window days 7–9, prevalence 0.1111 %, so a random ranker scores AUPRC = 0.0011.
+
+| Model | test AUPRC | 95 % CI | lift | alerts/day @ 90 % recall |
+|---|---|---|---|---|
+| Logistic regression | 0.0122 | [0.0114, 0.0132] | 11× | 180,530 |
+| Decision tree | 0.0217 | [0.0197, 0.0243] | 20× | 300,009 |
+| Random forest | 0.0473 | [0.0400, 0.0558] | 43× | 161,485 |
+| LightGBM | 0.0485 | [0.0420, 0.0560] | 44× | 197,667 |
+
+Random forest and LightGBM **cannot be separated** — their confidence intervals overlap, and
+we do not rank models on a difference inside the interval. More importantly, the best tabular
+model must flag **44 % of all transactions** to reach 90 % recall. That is the problem the
+graph features exist to solve.
+
+### E3 — adding causal account counters (no graph structure)
+
+| Model | E1 | E3 | 95 % CI | lift | alerts/day |
+|---|---|---|---|---|---|
+| Logistic regression | 0.0122 | 0.0061 ⬇ | [0.0057, 0.0065] | 5× | 94,041 |
+| Decision tree | 0.0217 | 0.2324 | [0.2072, 0.2509] | 209× | 74,180 |
+| Random forest | 0.0473 | 0.2226 | [0.1999, 0.2427] | 200× | 74,680 |
+| **LightGBM** | 0.0485 | **0.3575** | [0.3294, 0.3813] | **322×** | **58,267** |
+
+**This reframes the headline result.** Block B is per-account running counters — no graph
+structure at all — and it alone improves LightGBM 7.4×, cutting the alert load from 44 % of
+traffic to 13 %. Reporting "tabular vs tabular+graph" would therefore credit graph structure
+with an aggregation effect it did not produce.
+
+So the thesis is measured as **E2 − E3**, not E2 − E1: the structural and motif features of
+Phase 5 have to add something on top of 0.3575. All three arms appear in the report, with
+E1 → E3 labelled *account aggregation* and E3 → E2 labelled *graph structure*.
 
 ## Scope
 

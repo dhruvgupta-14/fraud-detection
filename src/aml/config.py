@@ -161,6 +161,7 @@ class ModelsConfig:
     stack_cv: str
     lightgbm: Mapping[str, Any]
     random_forest: Mapping[str, Any]
+    decision_tree: Mapping[str, Any]
     logistic_regression: Mapping[str, Any]
 
     def __post_init__(self) -> None:
