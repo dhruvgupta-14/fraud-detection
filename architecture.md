@@ -1285,16 +1285,116 @@ otherwise receive a teleport-only PageRank and a degree of 0. `active_mask()` (c
 is used to null those columns instead — declared `null_policy: dormant`. The highest observed
 rate is `src_amount_conservation` at 32.9 %.
 
-### Phase 6 — Evaluation depth · `NOT STARTED`
+### Phase 6 — Evaluation depth · `COMPLETE`
 
-| # | Component | Depends on | Figure |
+| # | Component | Depends on | Figure | Status |
+|---|---|---|---|---|
+| 26 | `src/aml/evaluate/typology.py` | 6,23 | F3 | ✅ |
+| 27 | `src/aml/evaluate/explain.py` | 23 | F5 | ✅ |
+| 28 | `src/aml/evaluate/figures.py` | 23,26,27 | F1, F2, F4 | ✅ |
+| 29 | `scripts/04_evaluate.py` | 28 | | ✅ |
+| 30 | `src/aml/evaluate/walkforward.py` | 21,23 | F6 | ✅ |
+| 31 | `scripts/05_walkforward.py` | 30 | | ✅ |
+
+All six figures regenerate from the pipeline. 172 tests pass. **Phase 6 produced three
+corrections to the evaluation design and one result that complicates the headline** — all of
+them belong in the report, because each is a case where the obvious version of the exhibit
+would have said something untrue.
+
+#### 🔴 F3 as specified is degenerate — fixed by fixing the alert budget, not the recall
+
+§9.3 asks for per-typology recall at each arm's operating point. But §8.4 *chooses* that
+operating point to hit 90 % recall, so comparing recall across arms at their own
+90 %-recall thresholds compares 90 % against 90 %. The chart is flat before any data is
+involved. Measured, at each arm's own threshold:
+
+| typology | n | E1 | E3 | E2 |
+|---|---|---|---|---|
+| GATHER-SCATTER | 181 | 0.978 | 0.994 | 1.000 |
+| SCATTER-GATHER | 170 | 0.988 | 0.988 | 0.988 |
+| CYCLE | 92 | 1.000 | 0.989 | 0.978 |
+| RANDOM | 56 | 0.982 | 1.000 | 0.982 |
+
+Every arm scores 0.97–1.00 on every family, tabular-only included. The AUPRC gap lives in
+**precision**, not in recall on annotated rows. F3 is therefore plotted at a **shared alert
+budget** — the question a compliance team actually asks: *given the same number of alerts an
+analyst can work, which typologies does each arm catch?*
+
+At a shared 32,503 alerts/day (E2's own operating cost):
+
+| typology | n | E1 | E3 | E2 | E2−E3 |
+|---|---|---|---|---|---|
+| UNANNOTATED | 582 | 0.576 | 0.679 | 0.727 | +0.048 |
+| GATHER-SCATTER | 181 | 0.945 | 0.961 | 1.000 | +0.039 |
+| SCATTER-GATHER | 170 | 0.959 | 0.976 | 0.988 | +0.012 |
+| STACK | 161 | 0.925 | 0.932 | 0.981 | +0.050 |
+| FAN-OUT | 94 | 0.904 | 0.979 | 1.000 | +0.021 |
+| CYCLE | 92 | 0.946 | 0.902 | 0.978 | **+0.076** |
+| FAN-IN | 91 | 0.934 | 0.978 | 0.978 | 0.000 |
+| BIPARTITE | 68 | 0.912 | 0.971 | 0.971 | 0.000 |
+| RANDOM | 56 | 0.857 | 0.946 | 0.982 | +0.036 |
+
+#### 🔴 The mechanism check is inconclusive, and the first version of it was unsound
+
+§9.3 predicts an asymmetry: graph features should help structured typologies more than
+RANDOM, and a *uniform* lift would be a leak signal. Pooled over structured families:
+
+| | baseline → E2 | Wilson 95 % |
+|---|---|---|
+| Structured (pooled) | 670/696 → **688/696** | [0.977, 0.994] |
+| RANDOM | 53/56 → **55/56** | [0.906, 0.997] |
+
+**Intervals overlap; the asymmetry cannot be demonstrated at this sample size.** The
+annotated families are near-saturated — even E1 catches 653/696 — so there is almost no
+headroom in which an asymmetry could show. CYCLE has the largest single delta (+0.076), the
+most structural typology and directionally right, but at n = 92 that is seven positives.
+
+**The first implementation of `asymmetry_check` declared a LEAK ALARM**, by averaging
+per-family recall deltas and finding RANDOM (+0.036) above the structured mean (+0.025).
+That +0.036 is *two positives out of 56*. Averaging rates gives a 56-positive family the
+same weight as a 181-positive one — precisely the small-N trap §9.3 warns against. It now
+pools counts and refuses a verdict unless the Wilson intervals separate. **An evaluation
+helper that always returns a confident answer is worse than none, because it launders noise
+into a finding**; `tests/test_evaluate.py` pins the corrected behaviour.
+
+Awkward corollary, reported rather than buried: **the graph features' largest recall gain is
+on the UNANNOTATED bucket** (0.576 → 0.727 across E1→E2, 582 positives) — exactly the rows
+that cannot be attributed to any typology.
+
+#### F5 — SHAP by feature group
+
+| group | share of mean \|SHAP\| | columns | per column |
 |---|---|---|---|
-| 26 | `src/aml/evaluate/typology.py` | 6,23 | F3 |
-| 27 | `src/aml/evaluate/explain.py` | 23 | F5 |
-| 28 | `src/aml/evaluate/figures.py` | 23,26,27 | F1, F2, F4 |
-| 29 | `scripts/04_evaluate.py` | 28 | |
-| 30 | `src/aml/evaluate/walkforward.py` | 21,23 | F6 |
-| 31 | `scripts/05_walkforward.py` | 30 | |
+| streaming | 57.9 % | 32 | 1.81 % |
+| tabular | 23.1 % | 17 | 1.36 % |
+| structural | 15.9 % | 22 | 0.72 % |
+| **motif** | **3.1 %** | 15 | **0.20 %** |
+
+Graph features account for **19.0 %** of total attribution. Only one graph column
+(`same_community`) reaches the top 15 individual features. **The motif block — the most
+literal expression of the thesis, the features shaped like the patterns in `Patterns.txt` —
+contributes least of any group.** Structural features (PageRank, communities, ego stats) do
+five times more work. That is a genuine, slightly deflating result and it is reported as one.
+
+#### 🔴 F6 measures training-data volume, not model decay
+
+| block | days | retrained | frozen |
+|---|---|---|---|
+| 1 | 2–3 | 0.0697 | 0.0697 |
+| 2 | 4–5 | 0.4195 | 0.0666 |
+| 3 | 6–7 | 0.4915 | 0.0661 |
+| 4 | 8–9 | 0.4906 | 0.0673 |
+
+The mean gap is +0.3004 and three of four blocks separate — but **the frozen arm is flat**
+(−0.0023 AUPRC, intervals overlapping). It does not degrade. The gap opens because the
+*retrained* arm improves as history accumulates: block 1 trains on days 0–1, where day 0 is
+structural cold-start and account counters are empty, so the early model learns from
+mostly-null graph features.
+
+§9.5 framed this as a decay study. It is not one. `summarise()` now tests whether the frozen
+arm actually declined before naming a verdict, and the figure title is set from the measured
+answer rather than the question we set out to ask — a chart headed "does the model decay?"
+would invite the opposite of the correct reading of its own contents.
 
 ### Phase 7 — Optional / gated · `NOT STARTED`
 

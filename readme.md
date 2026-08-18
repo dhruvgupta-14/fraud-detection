@@ -61,7 +61,7 @@ pip install -e .
 Verify:
 
 ```bash
-pytest -q                     # expect: 150 passed
+pytest -q                     # expect: 172 passed
 ```
 
 ### 2. Dataset
@@ -107,8 +107,8 @@ python scripts/01_graph.py                     # 10 daily snapshot graphs       
 python scripts/01_graph.py --verify-backend    # igraph vs networkx checkpoint
 python scripts/02_features.py                  # feature matrix + manifest    (~90 s)
 python scripts/03_train.py                     # 4 model rungs + predictions   (~5 min)
-python scripts/04_evaluate.py                  # metrics + report figures
-python scripts/05_walkforward.py               # rolling-origin decay study
+python scripts/04_evaluate.py                  # F1-F5 + metrics summary      (~1 min)
+python scripts/05_walkforward.py               # F6, rolling-origin           (~7 min)
 ```
 
 The headline ablation is two runs of the same code path against different configs:
@@ -153,8 +153,8 @@ separation is what makes "reproduce our results" a real claim rather than a hope
 | 3 — Features (cheap) | tabular + streaming blocks, causality assertions | ✅ complete |
 | 4 — First model | purged split, sampling, 4 model rungs, AUPRC | ✅ complete |
 | 5 — The thesis | structural + motif features, headline ablation | ✅ complete |
-| 6 — Evaluation depth | per-typology recall, SHAP, figures, walk-forward | ⬜ next |
-| 7–8 | optional viewer → report + demo | ⬜ |
+| 6 — Evaluation depth | per-typology recall, SHAP, figures, walk-forward | ✅ complete |
+| 7–8 | optional viewer → report + demo video | ⬜ next |
 
 ## Headline result
 
@@ -179,6 +179,30 @@ the alert queue from **58,267 to 32,503 per day at identical 90 % recall, a 44 %
 **Caveat stated up front:** this is synthetic data whose laundering patterns were inserted by
 a generator, so measured performance is an upper bound on what the same approach would achieve
 on real bank traffic.
+
+### Where the graph lift comes from
+
+SHAP attribution on the E2 model, aggregated by feature group:
+
+| group | share | columns | per column |
+|---|---|---|---|
+| streaming | 57.9 % | 32 | 1.81 % |
+| tabular | 23.1 % | 17 | 1.36 % |
+| structural | 15.9 % | 22 | 0.72 % |
+| motif | 3.1 % | 15 | 0.20 % |
+
+Graph features carry **19 % of total attribution**. Notably the *motif* block — the features
+deliberately shaped like the laundering patterns — contributes least; the general structural
+features (PageRank, communities, ego statistics) do five times more work.
+
+Two evaluation results complicate the headline and are reported rather than smoothed over:
+
+- **The per-typology mechanism check is inconclusive.** Structured typologies reach 688/696
+  and RANDOM 55/56 with overlapping Wilson intervals — the annotated families are
+  near-saturated, so the predicted structured-vs-RANDOM asymmetry has no headroom to appear.
+- **The walk-forward exhibit measures training-data volume, not model decay.** The frozen arm
+  is flat across all four blocks; the gap opens because the retrained arm improves as history
+  accumulates.
 
 ### Secondary finding: only boosting could use the graph features
 
