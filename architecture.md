@@ -58,7 +58,9 @@ These were measured directly from the files in this repo, not taken from the dat
 | **Usable modelling window** | **days 0–9 only** ⚠️ — 5,077,237 rows (99.98 %), 4,522 illicit |
 | **Generator tail** | **days 10–17** ⚠️ — 1,108 rows (0.02 %) at a **59.1 % illicit rate**, 664× the main window |
 | Attempt duration | **305 of 370 attempts span >1 day**, up to **8 days** ⚠️ |
-| Max out-degree / in-degree | **168,672** / 1,084 ⚠️ (single dominant hub) |
+| Max out / in **transaction count** | **168,672** / 1,084 — one dominant hub, **3.8 %** of non-self-loop rows |
+| Max out / in **degree** (distinct counterparties) | **14,230** / 545 ⚠️ *(corrected in Phase 2 — see §2.1)* |
+| Non-self-loop rows → **collapsed edges** | 4,487,133 → **647,939** ⚠️ (6.9× collapse) |
 | Distinct `(Bank, Account)` node keys | **515,088** |
 | Distinct `Account` strings alone | **515,080** ⚠️ (8 collisions — account numbers are *not* globally unique) |
 | Banks | 30,528 |
@@ -88,7 +90,43 @@ The originally configured split (train 0–10, val 11–12, test 13–17) would 
 
 The design is therefore a **purged temporal split** (§8.2), which keeps 913 annotated test rows across 208 attempts at a cost of 535 training positives.
 
-**⚠️ One node has out-degree 168,672.** Roughly a third of all non-self-loop edges originate at a single account. It will dominate PageRank mass and blow past any motif branch cap, so the cap and the `motif_censored` flag (§7.4) are load-bearing rather than defensive decoration.
+**⚠️ The hub figure was wrong, in both directions.** *(measured in Phase 2; this corrects what Phase 1 recorded)*
+
+The original claim — "one node has out-degree 168,672, roughly a third of all non-self-loop
+edges" — conflated two different quantities and overstated a third. Measured directly:
+
+| | Recorded | Measured |
+|---|---|---|
+| Hub out-degree (distinct receivers) | 168,672 | **14,230** |
+| Hub out **transactions** | — | **168,672** |
+| Share of non-self-loop rows | "roughly a third" | **3.8 %** |
+| Max in-degree | 1,084 | **545** (1,084 is the in-*transaction* count) |
+
+Both quoted "degrees" were transaction counts. The distinction matters because the two
+diverge by an order of magnitude precisely on the nodes we care about, so the backend now
+keeps them apart explicitly: `degrees()` means distinct counterparties, `tx_counts()` means
+transaction volume (§16, component 9).
+
+**What actually follows:**
+
+- **The motif branch cap is still load-bearing, for a smaller reason.** 14,230 distinct
+  receivers still exceeds `cfg.motifs.max_branch = 200` by 71×, so the cap and the
+  `motif_censored` flag (§7.4) still do real work — but the hub is not a third of the graph
+  and will not swallow the motif search whole.
+- **The hub is a high-throughput payer, not a structural monster.** 168,672 transactions
+  across 14,230 counterparties is ~12 transactions each — payroll or merchant settlement.
+  That is exactly the legitimate-but-laundering-shaped profile §9.6 predicts among top false
+  positives, and it is now a concrete account to inspect rather than a hypothetical.
+- **PageRank concentration is a much smaller worry** than "a third of all edges" implied.
+  Percentile-rank reporting stays (it costs nothing) but is no longer a mitigation for an
+  emergency.
+
+**⚠️ The graph is 6.9× smaller than the row count suggests.** 4,487,133 non-self-loop rows
+collapse to **647,939 distinct `(src, dst)` pairs** — the same account pairs transact
+repeatedly. Every snapshot is therefore a sub-million-edge graph, not a multi-million-edge
+one, which is the single largest reason the Phase 2 wall-clock came in far under budget
+(§6.1). Parallel edges are not discarded: their count and summed amount become edge
+attributes, so "these two accounts transacted 40 times" survives as a feature.
 
 **⚠️ Account numbers are not globally unique.**
 The canonical node key is the composite `(Bank, Account)`, interned to a contiguous `int32` node id. Using the bare account string would silently merge 8 distinct accounts and corrupt their degree/centrality. Cheap to get right; embarrassing to get wrong in a graph project.
@@ -346,7 +384,56 @@ Any drop in that coverage number is a parser bug, and the assertion is what tell
 
 ### 6.1 Backend decision (a documented deviation from the brief)
 
-The brief says "`networkx` is acceptable at HI-Small scale". **At the measured scale it is not, for the expensive features.** 515 K nodes × 4.5 M non-self-loop edges in networkx is roughly 3–5 GB of Python objects, with PageRank taking minutes per snapshot and Louvain considerably worse — × 18 snapshots × 2 ablation arms, that is the whole evening.
+The brief says "`networkx` is acceptable at HI-Small scale". We keep igraph — but **the
+original justification was wrong, and Phase 2 measured it instead of leaving the estimate
+standing. The real reason turned out to be correctness, not speed.**
+
+*What this section used to claim:* networkx at 515 K nodes × 4.5 M edges is 3–5 GB of Python
+objects, PageRank takes minutes per snapshot, Louvain worse, and × 18 snapshots × 2 ablation
+arms "that is the whole evening."
+
+*What was measured* on the real day-9 snapshot (515,088 nodes, 647,316 collapsed edges):
+
+| | Measured |
+|---|---|
+| igraph PageRank (PRPACK) | **1.00 s** |
+| igraph Louvain | **4.64 s** |
+| All 10 snapshots, build + persist | **29.7 s** |
+| Peak RSS | well under 1 GB |
+
+**Three corrections, and the third is the one that matters.**
+
+1. **The speed claim was wrong in both directions.** "Minutes per snapshot, the whole
+   evening" was far too dramatic; but a casual benchmark at library defaults understates the
+   gap, because networkx's default is *not converged* (see 3 below). Compared at **equal
+   accuracy** on a 95,841-node / 118,308-edge subgraph, igraph is **31.7×** faster
+   (0.56 s vs 17.87 s). Equal accuracy is the only comparison that means anything.
+2. **The arithmetic was wrong twice.** It multiplied by 18 snapshots (it is 10, §2.1) and by
+   2 ablation arms — snapshots are keyed on `graph`+`time` config and are therefore *shared*
+   by both arms. Memory was never the constraint either: the graph is 647 K edges, not
+   4.5 M, because parallel edges collapse 6.9× (§2.1).
+3. 🔴 **networkx's default PageRank tolerance is silently, badly wrong at this scale.**
+   networkx power-iterates and compares its L1 error against `N × tol`, so **result accuracy
+   degrades as the graph grows**. Measured against PRPACK's exact solve on a 95,841-node
+   induced subgraph:
+
+   | networkx `tol` | max abs diff | relative error, top-ranked node |
+   |---|---|---|
+   | **1e-6 (library default)** | 1.72e-04 | **44 %** |
+   | 1e-10 | 5.74e-08 | 0.015 % |
+   | 1e-14 | 3.10e-12 | ~0 |
+
+   It converges cleanly to the igraph answer, so our adapter is faithful — but a naive
+   `nx.pagerank(g)`, which is exactly what the brief's advice invites, would have produced a
+   **44 %-wrong centrality on the highest-mass accounts** with no error, no warning, and a
+   perfectly plausible-looking feature column. `NetworkxBackend.PAGERANK_TOL` is pinned to
+   1e-12 for this reason.
+
+**The decision therefore stands on a better claim than it started with.** Not "igraph is
+100× faster" — that was untrue — but "igraph solves the system exactly, while the obvious
+networkx call is quietly wrong by 44 % on precisely the nodes this project is about." The
+first is a speed preference; the second is a correctness requirement, and it is the kind of
+finding the report's methodology section exists to hold.
 
 **Decision:** a thin `GraphBackend` protocol with two implementations.
 
@@ -748,6 +835,34 @@ Every artifact path embeds a hash of the config subset that produced it, so two 
 - Dataset licence **CDLA-Sharing-1.0** noted in the README.
 - Real commit history showing iteration, not one deadline commit.
 
+### 13.4 Interpreter pin *(added at the Phase 1→2 boundary)*
+
+**`requirements.txt` pins packages but not the interpreter, and that gap bit us.** The build
+moved hosts between Phase 1 and Phase 2 onto a machine with only CPython 3.14 installed.
+Three pinned packages — `numpy==2.2.6`, `shap==0.52.0`, `python-igraph==1.0.0` — publish no
+cp314 wheels, so the environment could not be reconstructed at all.
+
+The fix is to state the interpreter as part of the contract rather than as a comment:
+
+```
+Python 3.12.x   (built and verified on 3.12.14)
+uv venv --python 3.12 && uv pip install -r requirements.txt && uv pip install -e .
+```
+
+The alternative — re-resolving every pin against 3.14 — was rejected. Reproducibility is
+explicitly judged, and unpinning a verified dependency set to chase a newer interpreter
+trades the thing being judged for nothing the project needs.
+
+> **The general lesson, and it belongs in the report's Limitations:** "pinned requirements"
+> is not the same claim as "reproducible environment". A pin set is only meaningful relative
+> to an interpreter and a platform, and ours silently was not portable across minor
+> versions. This is the same class of error as an unstated random seed.
+
+**`data/` does not survive a host migration.** It is correctly gitignored (475 MB, CDLA
+licensed, regenerable), so the README's Kaggle download commands are not documentation
+polish — they are the only recovery path for the raw inputs. That makes the README a Phase 0
+dependency in practice, not a Phase 8 deliverable.
+
 ---
 
 ## 14. Production architecture (documentation only)
@@ -785,7 +900,7 @@ The points that matter:
 
 | # | Risk | Likelihood | Mitigation |
 |---|---|---|---|
-| R1 | Snapshot feature computation blows the time budget | **High** | igraph backend; `account_fraction` escape hatch; snapshots cached and reused across all arms |
+| R1 | Snapshot feature computation blows the time budget | ~~High~~ → **Low for §7.3, unchanged for §7.4** | Measured in Phase 2: all 10 snapshots build in **29.7 s**, and PageRank + Louvain on the largest is **5.6 s**, against a 10 min budget. The graph is 647 K edges, not 4.5 M (§2.1). **The remaining risk is entirely the bounded motif search (Block D)** — the one part that is not a library call. The branch cap and `motif_censored` flag (§7.4) carry it, not the backend choice. `account_fraction` stays as the escape hatch. |
 | R2 | `Patterns.txt` → `Trans.csv` join is ambiguous | Medium | Natural-key join with an explicit collision report; coverage assertion; `UNANNOTATED` bucket |
 | R3 | `community_illicit_prior` leaks labels | Medium | §11.3 rules; separate ablation; SHAP dominance treated as an alarm |
 | R4 | Graph lift turns out small | Medium | **This is still a publishable result.** E3 isolates *why*; per-typology breakdown shows *where* it does help. A well-explained null result beats an unexplained win. |
@@ -793,8 +908,8 @@ The points that matter:
 | R6 | Motif search degenerates on hub nodes | Medium | Hard branch cap + `motif_censored` flag rather than silent truncation |
 | R7 | Streamlit app eats analysis time | Medium | Strictly last; hard timebox; cuttable with zero impact on results |
 | R8 | Test AUPRC unstable — only ~1.5 K positives in the test window | Medium | Bootstrap CIs on every reported metric; never rank models on a difference inside the CI |
-| R9 | **Host has 5.8 GB RAM** — the feature matrix (5.08 M × ~80 cols) will not fit in float64 | **High** | Measured in Phase 1, where ingest OOM'd twice. Mitigations: float32 feature dtype, column-wise assembly, `sampling.account_fraction` escape hatch, and training on the sub-sampled negative set rather than the full frame. Revisit before Phase 3. |
-| R10 | One node has out-degree 168,672 and will dominate PageRank | Medium | Report PageRank as a percentile rank as well as a raw value; motif branch cap + `motif_censored` flag prevent it from exploding the motif search |
+| R9 | Feature matrix (5.08 M × ~80 cols) does not fit in memory | ~~High~~ → **Low** | **Retired at the Phase 1→2 boundary: the build moved to a 15.7 GB / 16-core host** (was 5.8 GB, where ingest OOM'd twice). The matrix is 3.25 GB in float64 and 1.63 GB in float32, so it now fits either way. float32 is kept as the default because no tree model needs float64 precision and it halves the LightGBM binning copy — but it is a sensible default now, not a survival tactic. `sampling.account_fraction` stays as a wall-clock escape hatch, not a memory one. The memory-frugal ingest written under the old constraint is retained: it is strictly faster (29 s now, 52 s before), and reverting it would buy nothing. |
+| R10 | The hub node dominates PageRank and the motif search | ~~Medium~~ → **Low-Medium** | **Re-measured in Phase 2 and found substantially overstated** (§2.1): the hub's out-*degree* is 14,230, not 168,672, and it accounts for 3.8 % of non-self-loop rows, not "roughly a third". The branch cap still matters — 14,230 exceeds `max_branch = 200` by 71× — so `motif_censored` (§7.4) stays. PageRank percentile rank stays because it is free. The hub is now understood as a high-throughput payer and is a named error-analysis subject (§9.6) rather than an unquantified threat. |
 
 R4 deserves emphasis: the project is designed so that "graph features gave a modest lift, concentrated entirely in structurally-patterned typologies" is a *successful* outcome. The architecture measures the thesis; it does not require the thesis to win.
 
@@ -832,16 +947,65 @@ Nothing runs without these three. They are boring and they are load-bearing.
 
 Two findings from the EDA changed the architecture before any model was built — the generator tail (§2.1) and attempt straddling (§8.2). Both are recorded above and applied in `config/default.yaml`.
 
-### Phase 2 — Graph · `NOT STARTED`
+### Phase 2 — Graph · `COMPLETE`
 
-| # | Component | Depends on |
-|---|---|---|
-| 9 | `src/aml/graph/backend.py` | 5 |
-| 10 | `src/aml/graph/snapshots.py` | 9 |
-| 11 | `scripts/01_graph.py` | 10 |
-| 12 | `notebooks/02_graph_exploration.ipynb` | 11 |
+| # | Component | Depends on | Status |
+|---|---|---|---|
+| 9 | `src/aml/graph/backend.py` | 5 | ✅ |
+| 10 | `src/aml/graph/snapshots.py` | 9 | ✅ |
+| 11 | `scripts/01_graph.py` | 10 | ✅ |
+| 12 | `notebooks/02_graph_exploration.ipynb` | 11 | ✅ |
 
-**Checkpoint:** degree distributions sane; snapshot sizes monotone in day; igraph↔networkx equivalence spot-checked on a sampled config.
+**Checkpoint: passed.** 10 snapshots build in 29.7 s; cumulative edge counts are monotone
+(asserted in the script, not eyeballed); igraph↔networkx equivalence holds to 4.0e-10 on
+PageRank and 0.9996 pairwise agreement on Louvain over a 95,841-node / 118,308-edge induced
+subgraph. 91 tests pass.
+
+**Deviation in component 9: the backend takes CSR arrays, not a `Snapshot`.** §6.1 specifies
+the reverse, which makes 9 and 10 mutually dependent and neither testable alone. Inverting it
+means `snapshots.py` depends on `backend.py` and the backend is testable against six-node
+graphs whose PageRank can be checked by hand.
+
+The second consequence is the useful one: only PageRank and Louvain are genuinely
+backend-dependent, so degree, strength, transaction count, neighbours and the active mask
+are exact CSR arithmetic on a shared base class. **That reduces the equivalence check to the
+two functions that can actually disagree** — verifying `np.bincount` against a second call
+to `np.bincount` would be theatre.
+
+Two additions to the §6.1 protocol:
+
+- **`tx_counts()`** — transactions per node, with collapsed parallel edges expanded back
+  out. It resolved R10: the recorded "out-degree 168,672" was a transaction count, and the
+  true out-degree is 14,230 (§2.1). `degrees()` now means distinct counterparties.
+- **`active_mask()`** — snapshots span the full 515,088-node space so arrays are directly
+  `node_id`-indexed; the mask lets the feature layer null dormant accounts rather than
+  joining them a meaningless teleport-only PageRank.
+
+**Three findings from Phase 2 that changed the design.**
+
+1. 🔴 **networkx's default PageRank tolerance is 44 % wrong at this scale** (§6.1). This
+   replaced "speed" as the actual justification for the igraph backend.
+2. 🟡 **The `amount` column mixes 15 currencies with no FX table**, medians spanning six
+   orders of magnitude (Bitcoin 0.07 → Yen 97,334, a ratio of 1,425,094×). An amount-weighted
+   PageRank is therefore dimensionally meaningless — it partly ranks currencies rather than
+   accounts. Snapshots store **three** candidate weights (raw amount, currency-median-
+   normalised amount, transaction count) and Phase 5 chooses on validation AUPRC.
+
+   **Measured impact, reported honestly: much smaller than the reasoning predicts.** Top-100
+   PageRank overlap between raw and normalised weighting is **100 %**, and the hub ranks #1
+   under every weighting including unweighted — the ranking is driven by structure, not by
+   denomination. This was downgraded from 🔴 to 🟡 *after* measuring it. The finding is "a
+   dimensional error that would be indefensible if challenged, which on this dataset happens
+   not to change the answer" — worth fixing because it is cheap, not because it rescued a
+   result.
+3. 🟡 **The §6.2 window bound is off by one.** `(day_idx - lookback_days) <= d <= day_idx`
+   spans `lookback_days + 1` days, so the E7 sweep's "3d" point would really have been 4d.
+   Implemented as the `lookback_days` most recent days inclusive, and asserted in tests.
+
+**Louvain runs on the undirected projection.** Modularity is undefined on directed graphs,
+so `A→B` and `B→A` collapse to one edge with summed weight. This is a modelling assumption —
+that a laundering ring is a dense subgraph regardless of which way value moved — and it goes
+in the report rather than being applied silently.
 
 ### Phase 3 — Features, cheap half · `NOT STARTED`
 
@@ -944,7 +1108,10 @@ Every component in this document passes at least one of:
 | Split 0–10 / 11–12 / 13–17 | **0–5 / 6 / 7–9** | The original test window held 247 rows; the new one holds 1.35 M rows and 1,495 positives |
 | Straddling attempts → earlier split | **Purged temporal split** | 82 % of attempts straddle; the original rule left 59 annotated test rows (§8.2) |
 | Walk-forward 6 × 3 days | **5 × 2 days** | Follows from the 10-day window |
-| Assumed a normal dev machine | **Memory-frugal ingest**, float32 features planned | Built on a 5.8 GB machine; see R9 |
+| Assumed a normal dev machine | **Memory-frugal ingest**, float32 features | Phase 1 was built on a 5.8 GB machine and the ingest keeps those optimisations; Phase 2 onward runs on 15.7 GB / 16 cores. See R9 |
+| "networkx is acceptable" | igraph, **for correctness** | Not speed: `nx.pagerank`'s default tolerance is 44 % wrong on the top-ranked node at this scale (§6.1) |
+| Edge weight = amount | **Three weights stored**, choice deferred to Phase 5 | `amount` mixes 15 currencies with no FX table, medians spanning 6 orders of magnitude (§16 Phase 2) |
+| Lookback window `D - L <= d <= D` | `D - L + 1 <= d <= D` | The literal bound spans `L + 1` days and would mislabel every E7 point (§16 Phase 2) |
 
 ---
 
