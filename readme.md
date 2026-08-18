@@ -61,7 +61,7 @@ pip install -e .
 Verify:
 
 ```bash
-pytest -q                     # expect: 172 passed
+pytest -q                     # expect: 184 passed
 ```
 
 ### 2. Dataset
@@ -109,7 +109,20 @@ python scripts/02_features.py                  # feature matrix + manifest    (~
 python scripts/03_train.py                     # 4 model rungs + predictions   (~5 min)
 python scripts/04_evaluate.py                  # F1-F5 + metrics summary      (~1 min)
 python scripts/05_walkforward.py               # F6, rolling-origin           (~7 min)
+python scripts/06_demo_bundle.py               # data slice for the viewer     (~10 s)
 ```
+
+### Demo viewer
+
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Opens on <http://localhost:8501>. A **results viewer over batch predictions** — it reads the
+saved bundle and never scores a transaction live. Select any transaction to see its risk
+score and alert status, the SHAP drivers behind that score, and the account's transaction
+neighbourhood drawn from the graph snapshot the model actually read. Requires
+`scripts/06_demo_bundle.py` to have been run for the `ablation_graph` arm.
 
 The headline ablation is two runs of the same code path against different configs:
 
@@ -154,7 +167,8 @@ separation is what makes "reproduce our results" a real claim rather than a hope
 | 4 — First model | purged split, sampling, 4 model rungs, AUPRC | ✅ complete |
 | 5 — The thesis | structural + motif features, headline ablation | ✅ complete |
 | 6 — Evaluation depth | per-typology recall, SHAP, figures, walk-forward | ✅ complete |
-| 7–8 | optional viewer → report + demo video | ⬜ next |
+| 7 — Results viewer | Streamlit alert-triage demo | ✅ complete |
+| 8 — Deliverables | report + demo video | ⬜ next |
 
 ## Headline result
 

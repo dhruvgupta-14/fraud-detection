@@ -35,7 +35,7 @@ nbclient==0.11.0
 # --- dataset download ---
 kaggle==2.2.4
 
-# --- optional: Phase 7 results viewer (architecture.md 10.2) ---
-# Install only if the Streamlit viewer is built; it is the first component cut
-# under time pressure and nothing else depends on it.
-# streamlit==1.41.0
+# --- Phase 7 results viewer (architecture.md 10.2) ---
+# Reads saved predictions and a precomputed demo bundle. Nothing in the analysis
+# pipeline imports it, so removing this line cuts the viewer and nothing else.
+streamlit==1.61.1

@@ -1396,13 +1396,45 @@ arm actually declined before naming a verdict, and the figure title is set from 
 answer rather than the question we set out to ask — a chart headed "does the model decay?"
 would invite the opposite of the correct reading of its own contents.
 
-### Phase 7 — Optional / gated · `NOT STARTED`
+### Phase 7 — Optional / gated · `VIEWER COMPLETE, REST CUT`
 
-| # | Component | Gate |
-|---|---|---|
-| 32 | `src/aml/ingest/accounts.py` | Only if E5 shows measurable validation lift (Block E) |
-| 33 | `src/aml/viz/subgraph.py` | Needed for F7 and the demo — build even if 34 is cut |
-| 34 | `app/streamlit_app.py` | Hard timebox; first thing cut under pressure |
+| # | Component | Gate | Status |
+|---|---|---|---|
+| 32 | `src/aml/ingest/accounts.py` | Only if E5 shows measurable validation lift (Block E) | ⬜ **cut** — E5 never run; the account file stays out of scope |
+| 33 | `src/aml/viz/subgraph.py` | Needed for F7 and the demo | ⬜ **cut** — replaced by `viz/demo.py`, see below |
+| 34 | `app/streamlit_app.py` | Hard timebox; first thing cut under pressure | ✅ |
+
+**Component 33 was not built as specified, and F7 was dropped.** §10.1 lists F7 ("example
+subgraphs: a detected cycle and a detected fan-out") as a static report figure, and §16 lists
+`viz/subgraph.py` to produce it. The viewer renders ego networks interactively for any
+selected transaction, which covers the demo need that motivated F7 in the first place, so a
+separate static-figure module would be a second implementation of the same idea. Ego
+extraction lives in `src/aml/viz/demo.py` and **reuses `GraphBackend.neighbors` from
+component 9** — no new traversal was written.
+
+**The bundle, and why it exists.** `scripts/06_demo_bundle.py` precomputes a 774 KB slice —
+500 transactions with their features, per-row SHAP contributions, and the three arms'
+headline metrics. The app reads that plus the day-9 snapshot. Loading the 559 MB E2 feature
+matrix and the 1.8 M-row prediction table to display a few hundred alerts would make the app
+slow to start and awkward to demo.
+
+**Two honesty constraints built into the viewer**, both of which would otherwise let the
+demo overstate the system:
+
+- **The bundle includes lower-scored rows, not only top alerts.** A table containing only the
+  model's best hits makes every row look like a success; including confident negatives shows
+  what the model actually does.
+- **The ego network reports how many counterparties it did not draw.** Display is capped at
+  12 per direction, and the hub has 14,230 (§2.1) — rendering 12 of them silently would
+  misrepresent the graph, which is worse than an ugly chart. A test pins this.
+
+Ground truth labels and typologies are shown in the viewer, because it is a demo over a
+labelled test set rather than a production queue. Hiding them would make it look more capable
+than it is.
+
+**It runs clean**, verified rather than asserted: `tests/test_demo.py` executes the whole app
+headlessly through Streamlit's `AppTest` harness and fails on any uncaught exception, and
+checks that the four headline numbers actually reach the screen.
 
 ### Phase 8 — Deliverables · `NOT STARTED`
 
