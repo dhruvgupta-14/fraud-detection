@@ -61,7 +61,7 @@ pip install -e .
 Verify:
 
 ```bash
-pytest -q                     # expect: 91 passed
+pytest -q                     # expect: 120 passed
 ```
 
 ### 2. Dataset
@@ -105,7 +105,7 @@ re-running a stage with unchanged config is a no-op. Run in order:
 python scripts/00_ingest.py                    # raw -> canonical parquet        (~30 s)
 python scripts/01_graph.py                     # 10 daily snapshot graphs        (~30 s)
 python scripts/01_graph.py --verify-backend    # igraph vs networkx checkpoint
-python scripts/02_features.py                  # feature matrix + manifest
+python scripts/02_features.py                  # feature matrix + manifest    (~90 s)
 python scripts/03_train.py                     # model rungs + OOF predictions
 python scripts/04_evaluate.py                  # metrics + report figures
 python scripts/05_walkforward.py               # rolling-origin decay study
@@ -147,8 +147,9 @@ separation is what makes "reproduce our results" a real claim rather than a hope
 | 0 — Foundation | config, io, tests | ✅ complete |
 | 1 — Data | ingest, interner, patterns, EDA | ✅ complete |
 | 2 — Graph | backend, snapshots, snapshot CLI, exploration | ✅ complete |
-| 3 — Features (cheap) | tabular + streaming blocks | ⬜ next |
-| 4–8 | models → evaluation → explainability → report | ⬜ |
+| 3 — Features (cheap) | tabular + streaming blocks, causality assertions | ✅ complete |
+| 4 — First model | splits, sampling, training, AUPRC baseline | ⬜ next |
+| 5–8 | structural + motif features → evaluation → report | ⬜ |
 
 ## Scope
 

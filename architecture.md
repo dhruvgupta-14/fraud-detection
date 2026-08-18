@@ -1007,15 +1007,47 @@ so `A→B` and `B→A` collapse to one edge with summed weight. This is a modell
 that a laundering ring is a dense subgraph regardless of which way value moved — and it goes
 in the report rather than being applied silently.
 
-### Phase 3 — Features, cheap half · `NOT STARTED`
+### Phase 3 — Features, cheap half · `COMPLETE`
 
-| # | Component | Depends on | Block |
-|---|---|---|---|
-| 13 | `src/aml/features/base.py` | 3 | Protocol + registry + manifest emitter |
-| 14 | `src/aml/features/tabular.py` | 13 | A |
-| 15 | `src/aml/features/streaming.py` | 13 | B |
-| 16 | `src/aml/features/assemble.py` | 13,14,15 | Causality assertions A1–A5 live here |
-| 17 | `scripts/02_features.py` | 16 | |
+| # | Component | Depends on | Block | Status |
+|---|---|---|---|---|
+| 13 | `src/aml/features/base.py` | 3 | Protocol + registry + manifest emitter | ✅ |
+| 14 | `src/aml/features/tabular.py` | 13 | A — 17 columns, all `row_local` | ✅ |
+| 15 | `src/aml/features/streaming.py` | 13 | B — 32 columns, all `causal_streaming` | ✅ |
+| 16 | `src/aml/features/assemble.py` | 13,14,15 | Causality assertions A1–A5 live here | ✅ |
+| 17 | `scripts/02_features.py` | 16 | | ✅ |
+
+**Checkpoint: passed.** 49 feature columns over 5,077,237 rows in **88 s** (budget: 25 min),
+1.02 GB in memory as float32, 405 MB on disk. 120 tests pass. The E1 arm
+(`--experiment ablation_tabular`) emits 17 columns, all `row_local`, into its own hashed
+directory — the ablation is a config diff, verified end to end.
+
+**`streaming.py` is one explicit Python loop, not vectorised `groupby().cumsum().shift()`.**
+The vectorised form would be ~10× faster and equally correct, but the causality guarantee
+would then be spread across a dozen separate shift operations that each have to be right,
+and three of the columns (`turnover_latency`, `distinct_counterparties_*`, `unique_*_seen`)
+do not vectorise cleanly regardless. **The read-then-update order is the leakage argument**,
+and having it visible in one place — checkable by eye and by `tests/test_causality.py` — is
+worth more than seconds inside a budget we are 17× under. Hot state is held in Python lists
+rather than NumPy arrays: this loop does ~40 *scalar* accesses per row, where NumPy boxes a
+new object on every read.
+
+**`turnover_latency` reports a completed turnover, not the current one.** Defined naively as
+"time since this account last received", it would be an exact duplicate of
+`secs_since_last_in`. It instead carries the account's most recently *measured*
+receive-to-send gap, so a row learns that an account habitually flips money fast without
+learning anything about itself.
+
+**Nulls are emitted, not filled.** An account's first appearance has no history, and 0.0
+would tell a tree the gap since its last transfer was instantaneous — the opposite of the
+truth. LightGBM reads NaN natively, so honesty is free. Declared per column as
+`null_policy: cold_start` and asserted by A4; the highest rate is `dst_turnover_latency` at
+33.5 %.
+
+**One guard added beyond the spec, and why it earns its place.** An enabled feature group
+with no registered block silently contributes nothing. That is exactly how the E2 arm would
+quietly run as E3 and the headline lift would be reported against the wrong feature set, so
+`assemble.py` warns when a group is enabled but dormant.
 
 ### Phase 4 — First model · `NOT STARTED`
 
