@@ -6,7 +6,25 @@ build-backend = "setuptools.build_meta"
 name = "aml"
 version = "0.1.0"
 description = "Graph-feature AML detection on the IBM HI-Small transaction dataset"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel==7.3.0",
+    "kaggle==2.2.4",
+    "lightgbm==4.7.0",
+    "matplotlib==3.11.1",
+    "networkx==3.6.1",
+    "numpy==2.2.6",
+    "pandas==2.3.3",
+    "pyarrow==25.0.1",
+    "pytest==9.1.1",
+    "python-igraph==1.0.0",
+    "pyyaml==6.0.3",
+    "scikit-learn==1.9.0",
+    "scipy==1.18.0",
+    "seaborn==0.13.2",
+    "shap==0.52.0",
+    "tqdm==4.70.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
